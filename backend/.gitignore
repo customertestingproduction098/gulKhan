@@ -1,0 +1,22 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environment & credentials
+.env
+*.env.local
+service-account*.json
+credentials.json
+google-credentials.json
+
+# Runtime artifacts
+static/snapshots/*
+!static/snapshots/.gitkeep
+*.log
+logs/

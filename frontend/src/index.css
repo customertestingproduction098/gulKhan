@@ -1,0 +1,202 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    color-scheme: light;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    @apply bg-paper font-sans text-ink antialiased;
+  }
+
+  ::selection {
+    background: #b23b24;
+    color: #f6f7f1;
+  }
+
+  :focus-visible {
+    outline: 2px solid #b23b24;
+    outline-offset: 2px;
+  }
+
+  input[type='checkbox'],
+  input[type='radio'] {
+    accent-color: #b23b24;
+  }
+}
+
+@layer components {
+  .sheet {
+    @apply border border-rule bg-sheet shadow-sheet;
+    border-radius: 2px;
+  }
+
+  .sheet-head {
+    @apply flex flex-wrap items-center justify-between gap-3 border-b border-rule px-4 py-3 sm:px-5;
+  }
+
+  .sheet-pad {
+    @apply p-4 sm:p-5;
+  }
+
+  .eyebrow {
+    @apply font-mono text-[10px] font-bold uppercase leading-none tracking-label text-ink-soft;
+  }
+
+  .figure {
+    @apply font-mono text-[26px] tabular-nums leading-none tracking-tight text-ink;
+  }
+
+  .note {
+    @apply text-xs leading-relaxed text-ink-soft;
+  }
+
+  .tag {
+    @apply inline-flex items-center gap-1 border border-rule px-1.5 py-0.5 font-mono text-[10px] uppercase leading-relaxed tracking-[0.12em] text-ink-soft;
+    border-radius: 1px;
+  }
+
+  .tag-rust {
+    @apply border-rust text-rust;
+  }
+
+  .tag-sea {
+    @apply border-sea text-sea;
+  }
+
+  .tag-ochre {
+    @apply border-ochre text-ochre;
+  }
+
+  .stamp {
+    @apply inline-flex items-center gap-1.5 border border-current px-2 py-1 font-mono text-[10px] font-bold uppercase leading-none tracking-[0.14em];
+    border-radius: 1px;
+    box-shadow: 0 0 0 1px currentColor inset, 0 0 0 2px #f6f7f1 inset;
+    padding: 5px 8px;
+    transform: rotate(-1.6deg);
+    opacity: 0.94;
+  }
+
+  .stamp-sea {
+    @apply text-sea;
+  }
+
+  .stamp-ochre {
+    @apply text-ochre;
+  }
+
+  .stamp-rust {
+    @apply text-rust;
+  }
+
+  .stamp-quiet {
+    @apply text-ink-faint;
+  }
+
+  .stamp-enter {
+    animation: stamp-in 420ms cubic-bezier(0.2, 0.9, 0.3, 1.2) both;
+  }
+
+  .btn,
+  .btn-primary,
+  .btn-secondary,
+  .btn-danger,
+  .btn-quiet {
+    @apply inline-flex items-center justify-center gap-2 border px-3 py-2 font-mono text-[11px] font-bold uppercase leading-none tracking-[0.12em] transition-colors focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-45;
+    border-radius: 2px;
+  }
+
+  .btn-primary {
+    @apply border-ink bg-ink text-sheet hover:bg-ink/85;
+  }
+
+  .btn-secondary {
+    @apply border-rule bg-transparent text-ink hover:border-ink hover:bg-sheet-deep;
+  }
+
+  .btn-danger {
+    @apply border-rust bg-rust text-sheet hover:bg-rust-deep;
+  }
+
+  .btn-quiet {
+    @apply border-transparent text-ink-soft hover:text-ink;
+  }
+
+  .input {
+    @apply w-full border border-rule bg-sheet px-2.5 py-2 text-sm text-ink placeholder:text-ink-faint focus:border-ink focus:outline-none;
+    border-radius: 2px;
+  }
+
+  select.input {
+    @apply cursor-pointer pr-8;
+  }
+
+  .ledger {
+    @apply flex items-baseline gap-3;
+  }
+
+  .leader {
+    @apply mx-1 flex-1;
+    height: 0.55em;
+    background-image: radial-gradient(circle at 3px 100%, #b9c0b2 1.05px, transparent 1.35px);
+    background-size: 7px 100%;
+    background-repeat: repeat-x;
+  }
+
+  .meter {
+    @apply h-[7px] w-full border border-rule bg-sheet-deep;
+    border-radius: 1px;
+  }
+
+  .meter-fill {
+    @apply h-full bg-sea;
+  }
+
+  .tick {
+    @apply h-[9px] w-[3px] bg-sea;
+  }
+
+  .tick-missed {
+    @apply h-[9px] w-[3px] bg-ochre;
+  }
+
+  .log-row {
+    animation: row-in 260ms ease-out both;
+  }
+
+  .rule-list > * + * {
+    @apply border-t border-rule-soft;
+  }
+}
+
+@keyframes stamp-in {
+  from {
+    opacity: 0;
+    transform: rotate(-7deg) scale(1.18);
+  }
+  to {
+    opacity: 0.94;
+    transform: rotate(-1.6deg) scale(1);
+  }
+}
+
+@keyframes row-in {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .stamp-enter,
+  .log-row {
+    animation: none;
+  }
+}
