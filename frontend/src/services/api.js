@@ -52,7 +52,7 @@ export const alertApi = {
   pending: (params) => api.get(`/alerts/pending${buildQuery(params)}`).then((r) => r.data),
   get: (id) => api.get(`/alerts/${id}`).then((r) => r.data),
   acknowledge: (id) => api.post(`/alerts/${id}/acknowledge`).then((r) => r.data),
-  sendAlert: (payload) => api.post('/alerts/test', payload).then((r) => r.data),
+  sendAlert: (payload) => api.post('/alerts/send', payload).then((r) => r.data),
 }
 
 export const reportApi = {

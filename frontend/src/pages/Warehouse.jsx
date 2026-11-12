@@ -3,7 +3,7 @@ import { useDispatch, useSelector } from 'react-redux'
 import { toast } from 'react-toastify'
 import AlertLog from '../components/AlertLog'
 import CameraViewer from '../components/CameraViewer'
-import { IconBell, IconShield } from '../components/Icons'
+import { IconShield } from '../components/Icons'
 import { entryApi } from '../services/api'
 import { acknowledgeAlert, fetchAlerts } from '../store/slices/alertSlice'
 import {
@@ -22,11 +22,10 @@ function Verdict({ entry }) {
 
 export default function Warehouse() {
   const dispatch = useDispatch()
-  const { selectedChannel, totalChannels, loading, status } = useSelector((state) => state.camera)
-  const channelsKey = status?.allowed_channels ? status.allowed_channels.join(',') : '2,4,5,7,8,9,11'
+  const { selectedChannel, loading, status } = useSelector((state) => state.camera)
   const warehouseCameras = useMemo(
-    () => (status?.allowed_channels && status.allowed_channels.length > 0 ? status.allowed_channels : [2, 4, 5, 7, 8, 9, 11]),
-    [channelsKey],
+    () => (status?.allowed_channels?.length ? status.allowed_channels : [2, 4, 5, 7, 8, 9, 11]),
+    [status],
   )
   const alertItems = useSelector((state) => state.alerts.items)
   const alerts = useMemo(
@@ -186,7 +185,6 @@ export default function Warehouse() {
 
       <CameraViewer
         channel={selectedChannel}
-        totalChannels={warehouseCameras.length}
         channels={warehouseCameras}
         mode={MONITOR_MODES.WAREHOUSE}
         monitoring={monitoring}

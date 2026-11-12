@@ -48,8 +48,12 @@ export const percent = (part, total) => {
   return Math.round((Number(part) / Number(total)) * 100)
 }
 
+const DEFAULT_API_BASE = import.meta.env.PROD
+  ? 'https://gulkhan.onrender.com/api'
+  : 'http://localhost:5000/api'
+
 export const getApiBase = () =>
-  (import.meta.env.VITE_API_URL || 'http://localhost:5000/api').replace(/\/$/, '')
+  (import.meta.env.VITE_API_URL || DEFAULT_API_BASE).replace(/\/$/, '')
 
 export const getStreamUrl = (channel) =>
   `${getApiBase()}/camera/stream/${channel}?t=${Date.now()}`

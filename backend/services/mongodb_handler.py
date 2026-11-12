@@ -89,9 +89,11 @@ class MongoHandler:
                 self._ensure_indexes()
                 self._last_error = None
                 logger.info("Connected to MongoDB database '%s'", self.settings.mongo_db)
-            except PyMongoError as error:
-                self._last_error = f"MongoDB unavailable: {error}"
-                logger.error(self._last_error)
+            except Exception as error:
+                self._last_error = (
+                    f"MongoDB unavailable: {type(error).__name__}: {error}"
+                )
+                logger.exception(self._last_error)
                 raise DataStoreError(self._last_error) from error
 
     def _ensure_indexes(self) -> None:
@@ -130,6 +132,12 @@ class MongoHandler:
             return {"connected": True, "database": self.settings.mongo_db, "error": None}
         except (DataStoreError, PyMongoError) as error:
             return {"connected": False, "database": self.settings.mongo_db, "error": str(error)}
+        except Exception as error:  # noqa: BLE001 - health checks must never raise
+            return {
+                "connected": False,
+                "database": self.settings.mongo_db,
+                "error": f"{type(error).__name__}: {error}",
+            }
 
     def close(self) -> None:
         with self._lock:

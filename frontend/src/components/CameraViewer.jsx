@@ -6,7 +6,6 @@ const DEFAULT_ALLOWED = [2, 4, 5, 7, 8, 9, 11]
 
 export default function CameraViewer({
   channel = 2,
-  totalChannels = 7,
   channels: providedChannels,
   mode = MONITOR_MODES.WAREHOUSE,
   monitoring = false,
@@ -18,7 +17,6 @@ export default function CameraViewer({
   subtitle,
 }) {
   const [streamError, setStreamError] = useState(false)
-  const [loadingStream, setLoadingStream] = useState(true)
   const canvasRef = useRef(null)
 
   const channels =
@@ -31,7 +29,6 @@ export default function CameraViewer({
     let isMounted = true
     const abortController = new AbortController()
     setStreamError(false)
-    setLoadingStream(true)
 
     const SOI = new Uint8Array([0xff, 0xd8]) // Start of Image marker
     const EOI = new Uint8Array([0xff, 0xd9]) // End of Image marker
@@ -108,7 +105,6 @@ export default function CameraViewer({
                   ctx.drawImage(bitmap, 0, 0)
                 }
                 bitmap.close()
-                if (loadingStream) setLoadingStream(false)
               })
               .catch(() => {})
 
@@ -125,7 +121,6 @@ export default function CameraViewer({
       } catch (err) {
         if (err.name !== 'AbortError' && isMounted) {
           setStreamError(true)
-          setLoadingStream(false)
         }
       }
     }

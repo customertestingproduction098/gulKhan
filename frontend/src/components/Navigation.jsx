@@ -8,7 +8,6 @@ import {
   IconLogout,
   IconSettings,
   IconShield,
-  IconStore,
   IconWarehouse,
 } from './Icons'
 
