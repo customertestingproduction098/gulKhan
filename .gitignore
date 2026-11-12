@@ -47,4 +47,4 @@ desktop.ini
 mongodb-dump/
 
 # Local log captures
-error.txt
+error*.txt

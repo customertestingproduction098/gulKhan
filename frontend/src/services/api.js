@@ -3,7 +3,7 @@ import { buildQuery, getApiBase } from '../utils/helpers'
 
 const api = axios.create({
   baseURL: getApiBase(),
-  timeout: 30000,
+  timeout: Number(import.meta.env.VITE_API_TIMEOUT) || 120000,
   headers: { 'Content-Type': 'application/json' },
 })
 

@@ -325,6 +325,23 @@ the NVR password and keep `backend/.env` out of version control.
 - Publish directory: `dist`
 - Set `VITE_API_URL=https://<your-backend>.onrender.com/api`.
 
+### Keeping the free instance awake
+
+Render stops free web services after ~15 minutes without inbound HTTP traffic,
+and the next request can take 30-60s to boot. A scheduler running inside the
+backend cannot prevent this (it sleeps with the service), so the ping must come
+from an external runner.
+
+This repo includes `scripts/keep_alive.py` and the scheduled workflow
+`.github/workflows/keep-alive.yml`, which requests `/api/health` every 5 minutes
+(with retries that tolerate a cold start). Push to the default branch (`main`)
+and enable Actions if it is disabled; scheduled workflows only run from the
+default branch.
+
+Alternatives: a free uptime monitor (UptimeRobot, cron-job.org) pinging the same
+URL every 5-10 minutes, or a paid Render instance (no spin-down). One always-on
+free service uses roughly 730 of the 750 free instance hours per month.
+
 > RTSP cameras are usually on a private LAN. For cloud deployments, expose the
 > NVR through a secure tunnel/VPN or run the backend on-premises. Never expose an
 > NVR directly to the public internet.
