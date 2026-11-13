@@ -49,7 +49,7 @@ export const percent = (part, total) => {
 }
 
 const DEFAULT_API_BASE = import.meta.env.PROD
-  ? 'https://gulkhan.onrender.com/api'
+  ? 'https://gulkhan-production.up.railway.app/api'
   : 'http://localhost:5000/api'
 
 export const getApiBase = () =>
