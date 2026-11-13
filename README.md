@@ -311,7 +311,7 @@ the NVR password and keep `backend/.env` out of version control.
 - Root directory: `backend`
 - Python version: `3.12.7` (pinned in `backend/.python-version`)
 - Build command: `pip install --upgrade --no-cache-dir -r requirements.txt`
-- Start command: `gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --worker-class gthread --threads 4 --timeout 600 --graceful-timeout 30 --keep-alive 75`
+- Start command: `gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --worker-class gthread --threads 16 --timeout 600 --graceful-timeout 30 --keep-alive 75`
 - Health check path: `/api/health`
 - Add all `backend/.env` values as environment variables.
 - Keep **one worker**: camera connections, analysis, escalation, and schedulers
