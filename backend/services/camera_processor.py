@@ -23,10 +23,14 @@ import threading
 import time
 from typing import Any
 
-# Configure FFmpeg RTSP options for minimum latency (no packet buffering)
-os.environ.setdefault(
-    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
-    "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay",
+# Configure FFmpeg RTSP options for robust network streaming and HEVC/H.264 error resilience
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+    "rtsp_transport;tcp"
+    "|max_delay;500000"
+    "|reorder_queue_size;10"
+    "|fflags;nobuffer+discardcorrupt"
+    "|flags;low_delay"
+    "|ec;favor_inter"
 )
 
 import cv2
