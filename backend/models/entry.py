@@ -23,7 +23,7 @@ class Entry:
     person_count: int = 0
     confidence: float = 0.0
     warehouse_id: str = "warehouse_001"
-    entry_location: str = "main_gate"
+    entry_location: str = ""
     snapshot: str | None = None
     notes: str = ""
     alert_sent: bool = False
@@ -39,7 +39,7 @@ class Entry:
         self.confidence = clamp(float(self.confidence or 0.0), 0.0, 1.0)
         self.notes = (self.notes or "").strip()[:500]
         self.warehouse_id = (self.warehouse_id or "warehouse_001").strip()[:80]
-        self.entry_location = (self.entry_location or "main_gate").strip()[:80]
+        self.entry_location = (self.entry_location or "").strip()[:80]
         self.alert_channel = [str(item)[:20] for item in (self.alert_channel or [])]
         if self.severity not in SEVERITIES:
             self.severity = "warning"
@@ -61,7 +61,7 @@ class Entry:
             person_count=data.get("person_count", 0),
             confidence=data.get("confidence", 0.0),
             warehouse_id=data.get("warehouse_id", "warehouse_001"),
-            entry_location=data.get("entry_location", "main_gate"),
+            entry_location=data.get("entry_location") or "",
             snapshot=data.get("snapshot", data.get("frame_url")),
             notes=data.get("notes", ""),
             alert_sent=bool(data.get("alert_sent")),

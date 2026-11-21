@@ -61,11 +61,14 @@ MODE_WAREHOUSE = "warehouse"
 VALID_MODES = {MODE_SHOP, MODE_WAREHOUSE}
 
 SHOP_ABSENCE_GRACE_SECONDS = 2.5
-WAREHOUSE_ABSENCE_GRACE_SECONDS = 30.0
-FAST_POLL_SECONDS = 0.25
-MOTION_MIN_INTERVAL_SECONDS = 0.65
-MOTION_PIXEL_THRESHOLD = 22
-MOTION_RATIO_THRESHOLD = 0.006
+WAREHOUSE_ABSENCE_GRACE_SECONDS = 8.0
+WAREHOUSE_REALERT_SECONDS = 180.0
+FAST_POLL_SECONDS = 0.10
+MOTION_MIN_INTERVAL_SECONDS = 0.25
+WAREHOUSE_IDLE_PERIODIC_SECONDS = 5.0
+WAREHOUSE_PRESENT_PERIODIC_SECONDS = 2.0
+MOTION_PIXEL_THRESHOLD = 20
+MOTION_RATIO_THRESHOLD = 0.004
 
 
 @dataclass
@@ -93,9 +96,10 @@ class _ChannelMonitorState:
     person_present_since: float | None = None
     staff_established: bool = False
 
-    # Warehouse state (strictly per-camera deduplicated)
+    # Warehouse state (strictly per-camera)
     warehouse_present: bool = False
     warehouse_alert_sent: bool = False
+    warehouse_last_alert_mono: float = 0.0
     warehouse_cooldown_until: float = 0.0
     warehouse_empty_since: float | None = None
     dispatching_alert: bool = False
@@ -121,6 +125,7 @@ class FrameGrabber:
         self._frame = None
         self._last_frame_at: datetime | None = None
         self._last_access = time.monotonic()
+        self._last_stream_access = 0.0
         self._error: str | None = None
         self._running = False
         self._frames = 0
@@ -186,8 +191,10 @@ class FrameGrabber:
 
     def _capture_loop(self) -> None:
         retry_delay = 3.0
-        decode_interval = 1.0 / max(1, min(self.settings.camera_fps, 25))
+        stream_decode_interval = 1.0 / max(1, min(self.settings.camera_fps, 25))
+        monitor_decode_interval = 1.0 / min(max(1, self.settings.camera_fps), 6)
         last_decode = 0.0
+        consecutive_fast_grabs = 0
 
         while not self._stop.is_set():
             if self._cap is None and not self._open():
@@ -196,15 +203,28 @@ class FrameGrabber:
 
             # Continuously grab every incoming RTSP packet without sleeping so
             # the network socket buffer never accumulates old/delayed frames.
+            grab_start = time.monotonic()
             grabbed = self._cap.grab() if self._cap is not None else False
+            grab_elapsed = time.monotonic() - grab_start
             if not grabbed:
                 self._error = f"Camera {self.channel} stream interrupted"
                 self._release()
+                consecutive_fast_grabs = 0
                 self._stop.wait(retry_delay)
                 continue
 
+            # If grab() returned almost instantaneously (<4ms), packets were queued
+            # in FFmpeg/TCP receive buffers. Drain queued stale packets until we
+            # reach the live edge before decoding.
+            if grab_elapsed < 0.004 and self._frame is not None and consecutive_fast_grabs < 20:
+                consecutive_fast_grabs += 1
+                continue
+            consecutive_fast_grabs = 0
+
             now = time.monotonic()
-            if (now - last_decode) < decode_interval and self._jpeg is not None:
+            viewer_active = (now - self._last_stream_access) < 5.0
+            decode_interval = stream_decode_interval if viewer_active else monitor_decode_interval
+            if (now - last_decode) < decode_interval and self._frame is not None:
                 continue
 
             ret, frame = self._cap.retrieve() if self._cap is not None else (False, None)
@@ -233,20 +253,22 @@ class FrameGrabber:
                 cv2.LINE_AA,
             )
 
-            ok, buffer = cv2.imencode(
-                ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self.settings.jpeg_quality]
-            )
-            if not ok:
-                continue
+            jpeg: bytes | None = None
+            if viewer_active:
+                ok, buffer = cv2.imencode(
+                    ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self.settings.jpeg_quality]
+                )
+                if ok:
+                    jpeg = buffer.tobytes()
 
-            jpeg = buffer.tobytes()
             with self._lock:
                 self._frame = frame
                 self._jpeg = jpeg
                 self._last_frame_at = utcnow()
                 self._frames += 1
                 self._revision += 1
-                self._buffer.append((now, jpeg))
+                if jpeg is not None:
+                    self._buffer.append((now, jpeg))
                 self._first_frame.set()
 
             self._error = None
@@ -255,17 +277,39 @@ class FrameGrabber:
 
     # ---------------------------------------------------------------- readers
     def wait_for_frame(self, timeout: float = 8.0) -> bool:
-        return self._first_frame.wait(timeout=timeout) and self._jpeg is not None
+        return self._first_frame.wait(timeout=timeout) and self._frame is not None
 
     def read_jpeg(self) -> bytes | None:
-        self._last_access = time.monotonic()
+        now = time.monotonic()
+        self._last_access = now
+        self._last_stream_access = now
         with self._lock:
-            return self._jpeg
+            if self._jpeg is not None:
+                return self._jpeg
+            frame = None if self._frame is None else self._frame.copy()
+        if frame is None:
+            return None
+        ok, buffer = cv2.imencode(
+            ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self.settings.jpeg_quality]
+        )
+        if not ok:
+            return None
+        jpeg = buffer.tobytes()
+        with self._lock:
+            if self._jpeg is None:
+                self._jpeg = jpeg
+        return jpeg
 
     def read_frame(self):
         self._last_access = time.monotonic()
         with self._lock:
             return None if self._frame is None else self._frame.copy()
+
+    def read_frame_with_revision(self) -> tuple[int, Any]:
+        self._last_access = time.monotonic()
+        with self._lock:
+            frame = None if self._frame is None else self._frame.copy()
+            return self._revision, frame
 
     def recent_jpegs(self, seconds: float = 5.0) -> list[bytes]:
         cutoff = time.monotonic() - max(0.5, seconds)
@@ -290,7 +334,7 @@ class FrameGrabber:
             buffered = len(self._buffer)
         return {
             "channel": self.channel,
-            "connected": self._jpeg is not None and self._last_frame_at is not None,
+            "connected": self._frame is not None and self._last_frame_at is not None,
             "fps": round(self._frames / elapsed, 1),
             "last_frame_at": to_iso(self._last_frame_at),
             "buffered_frames": buffered,
@@ -553,12 +597,11 @@ class SurveillanceProcessor:
     def _run_channel(self, channel: int, state: _ChannelMonitorState) -> None:
         grabber = self.manager.get(channel, autostart=True)
         logger.info("Analysis loop started for channel %s (%s)", channel, self.mode)
-        periodic_interval = max(1.0, min(float(self.settings.analysis_interval_seconds), 2.0))
+        shop_periodic_interval = max(1.0, min(float(self.settings.analysis_interval_seconds), 2.0))
 
         while not state.stop_event.is_set():
             try:
-                rev = grabber.revision
-                frame = grabber.read_frame()
+                rev, frame = grabber.read_frame_with_revision()
                 if frame is None:
                     grabber.wait_for_frame(timeout=1.5)
                     state.last_error = grabber.status().get("error") or f"Waiting for camera {channel} frames"
@@ -571,26 +614,45 @@ class SurveillanceProcessor:
                     continue
                 state.last_frame_revision = rev
 
+                # In warehouse mode, skip expensive vision calls outside after-hours
+                if self.mode == MODE_WAREHOUSE:
+                    hours = self.owner_settings.after_hours()
+                    if not is_after_hours(hours["start"], hours["end"]):
+                        state.warehouse_present = False
+                        state.warehouse_alert_sent = False
+                        state.warehouse_last_alert_mono = 0.0
+                        state.warehouse_empty_since = None
+                        state.person_count = 0
+                        _, state.prev_gray = self._compute_motion(state.prev_gray, frame)
+                        state.stop_event.wait(1.0)
+                        continue
+
                 now = time.monotonic()
                 has_motion, state.prev_gray = self._compute_motion(state.prev_gray, frame)
                 elapsed_since_detect = now - state.last_detection_mono
 
+                if self.mode == MODE_WAREHOUSE:
+                    if state.warehouse_present:
+                        periodic_interval = WAREHOUSE_PRESENT_PERIODIC_SECONDS
+                        motion_interval = 1.0
+                    else:
+                        # Stay idle on static empty rooms so motion triggers Rekognition
+                        # IMMEDIATELY instead of colliding with an in-flight empty-room call.
+                        periodic_interval = WAREHOUSE_IDLE_PERIODIC_SECONDS
+                        motion_interval = MOTION_MIN_INTERVAL_SECONDS
+                else:
+                    periodic_interval = shop_periodic_interval
+                    motion_interval = MOTION_MIN_INTERVAL_SECONDS
+
                 should_detect = (
                     state.last_detection_mono == 0.0
                     or elapsed_since_detect >= periodic_interval
-                    or (has_motion and elapsed_since_detect >= MOTION_MIN_INTERVAL_SECONDS)
+                    or (has_motion and elapsed_since_detect >= motion_interval)
                 )
 
                 if should_detect:
-                    # If triggered by fresh motion while room was empty, wait 0.15s and grab
-                    # the latest frame so a person stepping through a doorway is fully in view.
-                    if has_motion and not state.warehouse_present and state.person_count == 0:
-                        state.stop_event.wait(0.15)
-                        fresh_frame = grabber.read_frame()
-                        if fresh_frame is not None:
-                            frame = fresh_frame
-                            _, state.prev_gray = self._compute_motion(state.prev_gray, frame)
-
+                    # Analyze the EXACT motion frame immediately with zero artificial delay
+                    # so brief appearances are captured on the exact frame where the person appears.
                     state.last_detection_mono = time.monotonic()
                     self._analyse_channel(channel, state, frame)
                     state.last_error = None
@@ -627,6 +689,17 @@ class SurveillanceProcessor:
         result = None
         if image_bytes and self.vision.available:
             result = self.vision.detect_persons(image_bytes)
+            if result is None:
+                # Rekognition is configured/enabled but failed transiently (timeout/network).
+                # Do NOT fall back to OpenCV HOG which generates false positives on empty rooms.
+                return {
+                    "person_count": 0,
+                    "confidence": 0.0,
+                    "labels": [],
+                    "persons": [],
+                    "source": "aws-rekognition-error",
+                    "error": True,
+                }
 
         if result is None:
             count, confidence, persons = self._hog_detect(analysis_frame)
@@ -641,11 +714,20 @@ class SurveillanceProcessor:
         min_conf = getattr(self.settings, "rekognition_min_confidence", None)
         if min_conf is None:
             min_conf = getattr(self.settings, "vision_min_confidence", 70.0)
-        if result.get("person_count", 0) and result.get("confidence", 1.0) < float(min_conf) / 100.0:
-            result["person_count"] = 0
-            result["persons"] = []
-        if not isinstance(result.get("persons"), list):
-            result["persons"] = []
+        min_ratio = float(min_conf) / 100.0
+        persons = result.get("persons") if isinstance(result.get("persons"), list) else []
+        valid_persons = [
+            p for p in persons if float(p.get("score", result.get("confidence", 0.0))) >= min_ratio
+        ]
+        result["persons"] = valid_persons
+        result["person_count"] = len(valid_persons)
+        if valid_persons:
+            result["confidence"] = round(
+                sum(float(p.get("score", 0.0)) for p in valid_persons) / len(valid_persons),
+                4,
+            )
+        else:
+            result["confidence"] = 0.0
         return result
 
     def _analyse_channel(self, channel: int, state: _ChannelMonitorState, frame) -> None:
@@ -1010,6 +1092,20 @@ class SurveillanceProcessor:
         return interaction.to_api()
 
     # -------------------------------------------------------------- warehouse
+    def _resolve_camera_location(self, channel: int) -> str:
+        """Return a camera-specific location only if explicitly configured."""
+        default_names = {f"camera {channel:02d}", f"camera {channel}"}
+        for cam in self.owner_settings.cameras():
+            if int(cam.get("channel", 0)) == int(channel):
+                loc = str(cam.get("location") or "").strip()
+                if loc and loc.lower() != "main_gate":
+                    return loc
+                name = str(cam.get("name") or "").strip()
+                if name and name.lower() not in default_names and name.lower() != "main_gate":
+                    return name
+                return ""
+        return ""
+
     def _handle_warehouse_channel(
         self,
         channel: int,
@@ -1022,35 +1118,60 @@ class SurveillanceProcessor:
             # Security only runs during non-operational hours (21:00–11:00 PKT).
             state.warehouse_present = False
             state.warehouse_alert_sent = False
+            state.warehouse_last_alert_mono = 0.0
             state.warehouse_empty_since = None
             return
 
+        # Ignore transient detector errors so we neither send false alerts nor
+        # prematurely reset the 3-minute presence timer while someone is in the room.
+        if result.get("error"):
+            return
+
+        persons = result.get("persons") if isinstance(result.get("persons"), list) else []
         person_count = int(result.get("person_count", 0))
+        if not persons:
+            person_count = 0
         now = time.monotonic()
 
         if person_count == 0:
-            if state.warehouse_empty_since is None:
-                state.warehouse_empty_since = now
-            elif now - state.warehouse_empty_since >= WAREHOUSE_ABSENCE_GRACE_SECONDS:
-                # Room has been continuously empty for 45+ seconds; reset presence session
-                state.warehouse_present = False
-                state.warehouse_alert_sent = False
+            if state.warehouse_present:
+                if state.warehouse_empty_since is None:
+                    state.warehouse_empty_since = now
+                elif now - state.warehouse_empty_since >= WAREHOUSE_ABSENCE_GRACE_SECONDS:
+                    # Person has left the room; reset presence session and 3-minute timer.
+                    state.warehouse_present = False
+                    state.warehouse_alert_sent = False
+                    state.warehouse_last_alert_mono = 0.0
+                    state.warehouse_empty_since = None
+            else:
+                state.warehouse_empty_since = None
             return
 
-        # Person is present in the frame! Reset empty timer.
+        # Person is confirmed present in this exact frame! Reset empty timer.
         state.warehouse_empty_since = None
 
-        # As long as someone is continuously present in the room, suppress any new email.
-        # Once they leave and the room becomes empty, the absence grace period resets
-        # warehouse_present = False and warehouse_alert_sent = False so that when someone
-        # returns, a new log and email are immediately dispatched.
-        if state.warehouse_present or state.warehouse_alert_sent or state.dispatching_alert:
+        if state.dispatching_alert:
             state.warehouse_present = True
             return
 
-        # Mark that someone has entered and the one alert for this session is being sent
+        realert_seconds = float(
+            getattr(self.settings, "warehouse_realert_seconds", WAREHOUSE_REALERT_SECONDS)
+            or WAREHOUSE_REALERT_SECONDS
+        )
+
+        is_repeat = False
+        if state.warehouse_present and state.warehouse_alert_sent:
+            # Person continues to stay in the room: suppress emails until 3 minutes
+            # have elapsed since the last email; if they leave earlier, the timer resets.
+            elapsed = now - state.warehouse_last_alert_mono
+            if elapsed < realert_seconds:
+                return
+            is_repeat = True
+
+        # Dispatch email immediately for fresh entry OR 3-minute continuous-presence repeat
         state.warehouse_present = True
         state.warehouse_alert_sent = True
+        state.warehouse_last_alert_mono = now
         state.dispatching_alert = True
 
         # Exact frame where the person was detected right now
@@ -1060,7 +1181,7 @@ class SurveillanceProcessor:
         # Dispatch snapshot upload + DB insert + email asynchronously so camera monitoring never blocks
         threading.Thread(
             target=self._record_and_email_warehouse_intrusion,
-            args=(channel, state, captured_frame, person_count, confidence),
+            args=(channel, state, captured_frame, person_count, confidence, is_repeat),
             name=f"warehouse-alert-ch-{channel}",
             daemon=True,
         ).start()
@@ -1072,10 +1193,17 @@ class SurveillanceProcessor:
         captured_frame,
         person_count: int,
         confidence: float,
+        is_repeat: bool = False,
     ) -> None:
         try:
             warehouse = self.owner_settings.get()["warehouse"]
+            location = self._resolve_camera_location(channel)
             snapshot = self._save_snapshot(captured_frame, f"warehouse_ch{channel:02d}")
+            notes = (
+                "Person still present outside working hours (3-minute follow-up)"
+                if is_repeat
+                else "Detected outside working hours (unknown person)"
+            )
             entry = Entry(
                 channel=channel,
                 authorized=False,
@@ -1083,9 +1211,9 @@ class SurveillanceProcessor:
                 person_count=person_count,
                 confidence=confidence,
                 warehouse_id=warehouse["id"],
-                entry_location=warehouse["entry_location"],
+                entry_location=location,
                 snapshot=snapshot,
-                notes="Detected outside working hours (unknown person)",
+                notes=notes,
                 severity="critical",
             )
 
@@ -1098,14 +1226,18 @@ class SurveillanceProcessor:
 
             self.store.log(
                 "warning",
-                "Warehouse entry recorded",
-                {"channel": channel, "after_hours": True, "entry_id": entry.id},
+                "Warehouse entry recorded (3-min follow-up)" if is_repeat else "Warehouse entry recorded",
+                {"channel": channel, "after_hours": True, "entry_id": entry.id, "is_repeat": is_repeat},
             )
             self._publish("entry.created", entry.to_api())
 
             snapshot_url = self._snapshot_url(snapshot)
             try:
-                self.alerts.create_warehouse_alert(entry, snapshot_url=snapshot_url)
+                self.alerts.create_warehouse_alert(
+                    entry,
+                    snapshot_url=snapshot_url,
+                    is_repeat=is_repeat,
+                )
             except Exception as error:  # noqa: BLE001
                 state.last_error = str(error)
                 logger.exception("Warehouse alert failed on channel %s: %s", channel, error)

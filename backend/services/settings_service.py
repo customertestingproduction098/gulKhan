@@ -29,7 +29,7 @@ from utils.helpers import (
 logger = logging.getLogger(__name__)
 
 USERNAME_PATTERN = re.compile(r"^[a-zA-Z0-9._-]{3,40}$")
-OPERATIONS_REVISION = 1
+OPERATIONS_REVISION = 2
 AFTER_HOURS_START = "21:00"
 AFTER_HOURS_END = "11:00"
 
@@ -147,8 +147,11 @@ class SettingsService:
                 revision = 0
             if revision < OPERATIONS_REVISION:
                 warehouse = merged.setdefault("warehouse", {})
-                warehouse["after_hours_start"] = AFTER_HOURS_START
-                warehouse["after_hours_end"] = AFTER_HOURS_END
+                if revision < 1:
+                    warehouse["after_hours_start"] = AFTER_HOURS_START
+                    warehouse["after_hours_end"] = AFTER_HOURS_END
+                if str(warehouse.get("entry_location") or "").strip().lower() == "main_gate":
+                    warehouse["entry_location"] = ""
                 merged["operations_revision"] = OPERATIONS_REVISION
                 seeded = True
 
@@ -467,8 +470,8 @@ class SettingsService:
                 "after_hours_start": after_start,
                 "after_hours_end": after_end,
                 "entry_location": str(
-                    warehouse.get("entry_location") or "main_gate"
-                )[:80],
+                    warehouse.get("entry_location") or ""
+                ).strip()[:80],
             },
             "notifications": {
                 "email": bool(notifications.get("email", True)),
@@ -560,12 +563,13 @@ class SettingsService:
         normalized = []
         for channel in self.settings.allowed_cameras:
             item = supplied.get(channel, {})
-            normalized.append(
-                {
-                    "channel": channel,
-                    "name": str(item.get("name") or f"Camera {channel:02d}")[:80],
-                    "enabled": bool(item.get("enabled", True)),
-                }
-            )
+            entry = {
+                "channel": channel,
+                "name": str(item.get("name") or f"Camera {channel:02d}")[:80],
+                "enabled": bool(item.get("enabled", True)),
+            }
+            if item.get("location"):
+                entry["location"] = str(item.get("location")).strip()[:80]
+            normalized.append(entry)
         return normalized
 

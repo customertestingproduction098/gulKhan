@@ -826,7 +826,7 @@ class MongoHandler:
             local = to_local(item.created_at)
             if local:
                 hours[local.hour] += 1
-            locations[item.entry_location or "main_gate"] += 1
+            locations[item.entry_location or f"Camera {item.channel:02d}"] += 1
         total = len(entries)
         false_alarms = sum(1 for item in entries if item.false_alarm)
         return {

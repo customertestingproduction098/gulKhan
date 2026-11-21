@@ -145,6 +145,9 @@ class Settings:
     alert_cooldown_seconds: float = field(
         default_factory=lambda: _float("ALERT_COOLDOWN_SECONDS", 120.0)
     )
+    warehouse_realert_seconds: float = field(
+        default_factory=lambda: _float("WAREHOUSE_REALERT_SECONDS", 180.0)
+    )
     shop_open_time: str = field(default_factory=lambda: _str("SHOP_OPEN_TIME", "06:00"))
     shop_close_time: str = field(default_factory=lambda: _str("SHOP_CLOSE_TIME", "21:00"))
     after_hours_start: str = field(
@@ -162,7 +165,7 @@ class Settings:
         default_factory=lambda: _str("WAREHOUSE_NAME", "Main Warehouse")
     )
     entry_location: str = field(
-        default_factory=lambda: _str("WAREHOUSE_ENTRY_LOCATION", "main_gate")
+        default_factory=lambda: _str("WAREHOUSE_ENTRY_LOCATION", "")
     )
     unattended_alert_seconds: float = field(
         default_factory=lambda: _float("UNATTENDED_ALERT_SECONDS", 10.0)

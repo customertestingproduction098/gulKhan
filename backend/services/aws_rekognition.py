@@ -28,10 +28,10 @@ def _get_client():
             return _client
         settings = get_settings()
         cfg = Config(
-            connect_timeout=4,
-            read_timeout=8,
+            connect_timeout=3,
+            read_timeout=6,
             max_pool_connections=25,
-            retries={"max_attempts": 2},
+            retries={"max_attempts": 1},
         )
         session_kwargs = {
             "region_name": settings.aws_region or "ap-south-1",
@@ -70,6 +70,7 @@ class AWSRekognitionService:
             min_conf = float(self.settings.rekognition_min_confidence)
             response = client.detect_labels(
                 Image={"Bytes": image_bytes},
+                MaxLabels=25,
                 MinConfidence=min_conf,
             )
             persons: list[dict[str, Any]] = []
@@ -87,8 +88,8 @@ class AWSRekognitionService:
                     y1 = float(box.get("Top", 0.0) or 0.0)
                     w = float(box.get("Width", 0.0) or 0.0)
                     h = float(box.get("Height", 0.0) or 0.0)
-                    # Require a non-trivial bounding box so noise/artifacts are ignored
-                    if w <= 0.01 or h <= 0.01:
+                    # Require a non-trivial bounding box so tiny noise/reflections/edge slivers are ignored
+                    if w < 0.025 or h < 0.05 or (w * h) < 0.0015:
                         continue
                     persons.append(
                         {

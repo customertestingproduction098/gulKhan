@@ -22,7 +22,7 @@ from config.settings import Settings, get_settings
 from models import Alert, Entry, Interaction
 from services.mongodb_handler import DataStoreError, MongoHandler
 from services.settings_service import SettingsService
-from utils.helpers import to_iso, utcnow
+from utils.helpers import current_time, to_iso, to_local, utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -89,13 +89,20 @@ class AlertSystem:
             context = ssl.create_default_context()
             if self.settings.smtp_secure:
                 with smtplib.SMTP_SSL(
-                    self.settings.smtp_host, self.settings.smtp_port, context=context
+                    self.settings.smtp_host,
+                    self.settings.smtp_port,
+                    context=context,
+                    timeout=15,
                 ) as server:
                     if self.settings.smtp_user:
                         server.login(self.settings.smtp_user, self.settings.smtp_pass)
                     server.sendmail(self.settings.mail_from, [recipient], message.as_string())
             else:
-                with smtplib.SMTP(self.settings.smtp_host, self.settings.smtp_port) as server:
+                with smtplib.SMTP(
+                    self.settings.smtp_host,
+                    self.settings.smtp_port,
+                    timeout=15,
+                ) as server:
                     server.ehlo()
                     server.starttls(context=context)
                     server.ehlo()
@@ -179,7 +186,7 @@ class AlertSystem:
         return {
             "email": self.send_email(
                 subject=f"[Sentinel AI] {title}"
-                + (f" - Camera {channel}" if channel else ""),
+                + (f" - Camera {channel:02d}" if channel else ""),
                 html_body=html_body,
             ),
             "push": self.send_push(
@@ -194,20 +201,32 @@ class AlertSystem:
         self,
         entry: Entry,
         snapshot_url: str | None = None,
+        is_repeat: bool = False,
     ) -> Alert:
         after_hours = "after hours" if entry.after_hours else "during working hours"
-        title = (
-            "Unauthorized after-hours entry"
-            if entry.after_hours and not entry.authorized
-            else "Warehouse entry detected (after hours)"
-            if entry.after_hours
-            else "Warehouse entry detected"
-        )
-        local_time = datetime.now().strftime("%d %b %Y, %H:%M:%S")
-        message = (
-            f"{entry.person_count} person(s) detected on camera {entry.channel} "
-            f"{after_hours} at {local_time}. Snapshot attached. Location: {entry.entry_location or 'warehouse'}."
-        )
+        if is_repeat:
+            title = "Person still present after hours (3-min follow-up)"
+        else:
+            title = (
+                "Unauthorized after-hours entry"
+                if entry.after_hours and not entry.authorized
+                else "Warehouse entry detected (after hours)"
+                if entry.after_hours
+                else "Warehouse entry detected"
+            )
+        local_time = current_time().strftime("%d %b %Y, %H:%M:%S")
+        location_text = (entry.entry_location or "").strip()
+        location_suffix = f" Location: {location_text}." if location_text else ""
+        if is_repeat:
+            message = (
+                f"{entry.person_count} person(s) still present on Camera {entry.channel:02d} "
+                f"{after_hours} at {local_time} (3-minute follow-up). Snapshot attached.{location_suffix}"
+            )
+        else:
+            message = (
+                f"{entry.person_count} person(s) detected on Camera {entry.channel:02d} "
+                f"{after_hours} at {local_time}. Snapshot attached.{location_suffix}"
+            )
         severity = (
             "critical"
             if entry.after_hours and not entry.authorized
@@ -473,6 +492,13 @@ class AlertSystem:
             if snapshot_url
             else ""
         )
+        local_dt = to_local(entry.created_at) or current_time()
+        formatted_time = local_dt.strftime("%d %b %Y, %H:%M:%S")
+        meta_parts = [f"Camera {entry.channel:02d}"]
+        if (entry.entry_location or "").strip():
+            meta_parts.append(entry.entry_location.strip())
+        meta_parts.append(formatted_time)
+        meta_line = " - ".join(meta_parts)
         return f"""
         <div style="font-family:Arial,sans-serif;max-width:560px;margin:auto">
           <div style="background:#fee2e2;color:#991b1b;padding:16px 20px;border-radius:12px">
@@ -480,8 +506,7 @@ class AlertSystem:
           </div>
           <p style="color:#334155;font-size:15px">{html.escape(message)}</p>
           <p style="color:#64748b;font-size:13px">
-            Camera {entry.channel} - {html.escape(entry.entry_location)} -
-            {html.escape(to_iso(entry.created_at) or "")}
+            {html.escape(meta_line)}
           </p>
           {snapshot}
           <p style="color:#94a3b8;font-size:12px;margin-top:24px">
