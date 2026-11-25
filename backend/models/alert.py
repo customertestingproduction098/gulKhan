@@ -45,25 +45,37 @@ class Alert:
         self.owner_email = (self.owner_email or "").strip()
         self.snapshot = self.snapshot or self.metadata.get("snapshot_url")
 
+        self.apply_delivery(self.delivery, preserve_status=self.status)
+
+    def apply_delivery(
+        self,
+        delivery: dict[str, Any] | None,
+        preserve_status: str = "",
+    ) -> None:
+        self.delivery = delivery or {}
         channels = [
             name
-            for name, result in (self.delivery or {}).items()
+            for name, result in self.delivery.items()
             if isinstance(result, dict) and result.get("sent")
         ]
         if channels:
             self.sent_channels = sorted(set(self.sent_channels) | set(channels))
 
-        status = (self.status or "").upper()
+        failed = [
+            name
+            for name, result in self.delivery.items()
+            if isinstance(result, dict)
+            and not result.get("skipped")
+            and result.get("sent") is False
+        ]
+
+        status = (preserve_status or "").upper()
         if self.acknowledged:
             status = "ACKNOWLEDGED"
         elif status not in STATUSES or status == "PENDING":
             if self.sent_channels:
-                attempted = len(self.delivery or {})
-                status = "SENT" if len(self.sent_channels) == attempted else "PARTIAL"
-            elif any(
-                isinstance(result, dict) and result.get("sent") is False
-                for result in (self.delivery or {}).values()
-            ):
+                status = "PARTIAL" if failed else "SENT"
+            elif failed:
                 status = "FAILED"
             elif self.delivery:
                 status = "SKIPPED"

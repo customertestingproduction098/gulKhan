@@ -60,7 +60,15 @@ const alertSlice = createSlice({
       .addCase(acknowledgeAlert.fulfilled, (state, action) => {
         const id = action.payload?.id ?? action.meta.arg
         state.items = state.items.map((alert) =>
-          alert.id === id ? { ...alert, acknowledged: true } : alert,
+          alert.id === id
+            ? {
+                ...alert,
+                ...(action.payload?.alert || {}),
+                acknowledged: true,
+                status: 'ACKNOWLEDGED',
+                acknowledged_at: action.payload?.acknowledged_at || alert.acknowledged_at,
+              }
+            : alert,
         )
       })
       .addCase(acknowledgeAlert.rejected, (state, action) => {

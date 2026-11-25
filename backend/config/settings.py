@@ -145,8 +145,8 @@ class Settings:
     alert_cooldown_seconds: float = field(
         default_factory=lambda: _float("ALERT_COOLDOWN_SECONDS", 120.0)
     )
-    warehouse_realert_seconds: float = field(
-        default_factory=lambda: _float("WAREHOUSE_REALERT_SECONDS", 180.0)
+    warehouse_absence_grace_seconds: float = field(
+        default_factory=lambda: _float("WAREHOUSE_ABSENCE_GRACE_SECONDS", 8.0)
     )
     shop_open_time: str = field(default_factory=lambda: _str("SHOP_OPEN_TIME", "06:00"))
     shop_close_time: str = field(default_factory=lambda: _str("SHOP_CLOSE_TIME", "21:00"))
@@ -154,7 +154,7 @@ class Settings:
         default_factory=lambda: _str("WAREHOUSE_AFTER_HOURS_START", "21:00")
     )
     after_hours_end: str = field(
-        default_factory=lambda: _str("WAREHOUSE_AFTER_HOURS_END", "11:00")
+        default_factory=lambda: _str("WAREHOUSE_AFTER_HOURS_END", "06:00")
     )
     shop_id: str = field(default_factory=lambda: _str("SHOP_ID", "shop_001"))
     shop_name: str = field(default_factory=lambda: _str("SHOP_NAME", "Main Shop"))
@@ -198,9 +198,9 @@ class Settings:
         else _bool("REKOGNITION_ENABLED", True)
     )
     rekognition_min_confidence: float = field(
-        default_factory=lambda: _float("VISION_MIN_CONFIDENCE", 70.0)
+        default_factory=lambda: _float("VISION_MIN_CONFIDENCE", 85.0)
         if _str("VISION_MIN_CONFIDENCE")
-        else _float("REKOGNITION_MIN_CONFIDENCE", 70.0)
+        else _float("REKOGNITION_MIN_CONFIDENCE", 85.0)
     )
 
     # Google Cloud (kept for Firebase push only if needed)
@@ -258,6 +258,9 @@ class Settings:
     )
     cloudinary_folder: str = field(
         default_factory=lambda: _str("CLOUDINARY_FOLDER", "sentinel-ai/snapshots")
+    )
+    cloudinary_timeout_seconds: int = field(
+        default_factory=lambda: _int("CLOUDINARY_TIMEOUT_SECONDS", 15)
     )
 
     # Escalation timings (seconds after the alert is raised)
@@ -322,10 +325,6 @@ class Settings:
             channel=channel,
             subtype=self.camera_subtype,
         )
-
-    @property
-    def vision_configured(self) -> bool:
-        return bool(self.google_credentials) and self.vision_enabled
 
     @property
     def openrouter_configured(self) -> bool:

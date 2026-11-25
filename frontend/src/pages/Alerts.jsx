@@ -3,7 +3,8 @@ import { useDispatch, useSelector } from 'react-redux'
 import { toast } from 'react-toastify'
 import { alertApi } from '../services/api'
 import { acknowledgeAlert, fetchAlerts } from '../store/slices/alertSlice'
-import { cx, formatDate, formatTime, timeAgo } from '../utils/helpers'
+import { cx } from '../utils/helpers'
+import { formatDateTime, timeAgo } from '../utils/time'
 import { IconAlert, IconCheck, IconRefresh } from '../components/Icons'
 
 const severityTag = {
@@ -19,6 +20,62 @@ const FILTERS = [
   { value: 'info', label: 'Info' },
 ]
 
+const isAcknowledged = (alert) =>
+  Boolean(alert?.acknowledged || String(alert?.status || '').toLowerCase() === 'acknowledged')
+
+const formatChannelName = (name) =>
+  name ? name.charAt(0).toUpperCase() + name.slice(1).replace(/_/g, ' ') : 'Channel'
+
+function describeDelivery(alert) {
+  const sent = Array.isArray(alert?.sent_channels) ? alert.sent_channels.filter(Boolean) : []
+  const delivery = alert?.delivery && typeof alert.delivery === 'object' ? alert.delivery : {}
+  const entries = Object.entries(delivery).filter(([, info]) => info && typeof info === 'object')
+
+  const failures = entries
+    .filter(([, info]) => !info.skipped && info.sent === false)
+    .map(([ch, info]) => `${formatChannelName(ch)} failed: ${info.error || 'delivery error'}`)
+
+  const skipped = entries
+    .filter(([, info]) => info.skipped)
+    .map(([ch, info]) => `${formatChannelName(ch)} skipped: ${info.error || 'not configured'}`)
+
+  if (sent.length > 0) {
+    const sentText = `Sent via ${sent.join(', ')}`
+    if (failures.length > 0) {
+      return { text: `${sentText} · ${failures.join('; ')}`, tone: 'text-ochre' }
+    }
+    return { text: sentText, tone: 'text-sea' }
+  }
+
+  if (failures.length > 0) {
+    return { text: failures.join('; '), tone: 'text-rust' }
+  }
+
+  if (skipped.length > 0) {
+    return { text: skipped.join('; '), tone: 'text-ochre' }
+  }
+
+  if (String(alert?.status || '').toUpperCase() === 'PENDING') {
+    return { text: 'Delivery pending…', tone: 'text-ink-soft' }
+  }
+
+  return { text: 'Not delivered', tone: 'text-ink-soft' }
+}
+
+function getLocationLabel(alert) {
+  const loc = (alert?.metadata?.location || alert?.metadata?.entry_location || '').trim()
+  if (loc) return loc
+  return ''
+}
+
+function getAlertTypeLabel(alert) {
+  const raw = alert?.alert_type || alert?.type || 'alert'
+  if (raw === 'warehouse_entry') {
+    return getLocationLabel(alert) ? 'Room entry' : 'After-hours entry'
+  }
+  return raw.replace(/_/g, ' ')
+}
+
 export default function Alerts() {
   const dispatch = useDispatch()
   const { items = [], loading, error } = useSelector((state) => state.alerts)
@@ -30,7 +87,7 @@ export default function Alerts() {
   const load = useCallback(() => {
     const params = { limit: 100 }
     if (severity) params.severity = severity
-    if (pendingOnly) params.status = 'pending'
+    if (pendingOnly) params.acknowledged = false
     dispatch(fetchAlerts(params))
   }, [dispatch, pendingOnly, severity])
 
@@ -40,10 +97,16 @@ export default function Alerts() {
 
   const handleAcknowledge = async (alert) => {
     try {
-      await dispatch(acknowledgeAlert(alert.id)).unwrap()
+      const res = await dispatch(acknowledgeAlert(alert.id)).unwrap()
       toast.success('Alert acknowledged')
       if (selected?.id === alert.id) {
-        setSelected({ ...selected, acknowledged: true, status: 'acknowledged' })
+        setSelected({
+          ...selected,
+          ...(res?.alert || {}),
+          acknowledged: true,
+          status: 'ACKNOWLEDGED',
+          acknowledged_at: res?.acknowledged_at || new Date().toISOString(),
+        })
       }
       load()
     } catch (err) {
@@ -64,9 +127,17 @@ export default function Alerts() {
     }
   }
 
-  const pending = items.filter((alert) => !alert.acknowledged && alert.status !== 'acknowledged')
+  const pending = items.filter((alert) => !isAcknowledged(alert))
   const critical = items.filter((alert) => alert.severity === 'critical').length
-  const selectedAcknowledged = selected && (selected.acknowledged || selected.status === 'acknowledged')
+  const selectedAcknowledged = selected ? isAcknowledged(selected) : false
+  const selectedDelivery = selected ? describeDelivery(selected) : null
+  const selectedLocation = selected ? getLocationLabel(selected) : ''
+  const selectedEscalations = Array.isArray(selected?.escalations)
+    ? selected.escalations
+        .map((step) => step?.stage || step?.channel || step?.level)
+        .filter(Boolean)
+        .map((label) => String(label).replace(/_/g, ' '))
+    : []
 
   return (
     <div className="space-y-5">
@@ -143,7 +214,7 @@ export default function Alerts() {
               </div>
             )}
             {items.filter(alert => alert.title !== 'System Alert' && alert.title !== 'Test alert').map((alert) => {
-              const acknowledged = alert.acknowledged || alert.status === 'acknowledged'
+              const acknowledged = isAcknowledged(alert)
               const isSelected = selected?.id === alert.id
               return (
                 <button
@@ -200,9 +271,8 @@ export default function Alerts() {
                     <span className={severityTag[selected.severity] || severityTag.info}>
                       {selected.severity || 'info'}
                     </span>
-                    <span className="tag">
-                      {(selected.alert_type || selected.type || 'alert').replace(/_/g, ' ')}
-                    </span>
+                    <span className="tag">{getAlertTypeLabel(selected)}</span>
+                    {selectedLocation && <span className="tag">{selectedLocation}</span>}
                     {selected.channel != null && (
                       <span className="tag">CH {String(selected.channel).padStart(2, '0')}</span>
                     )}
@@ -227,34 +297,34 @@ export default function Alerts() {
                   <dt className="eyebrow">Detected</dt>
                   <span className="leader" aria-hidden="true" />
                   <dd className="font-mono text-[11px] text-ink">
-                    {formatDate(selected.created_at)} · {formatTime(selected.created_at)}
+                    {formatDateTime(selected.created_at)}
                   </dd>
                 </div>
                 <div className="ledger py-2.5">
-                  <dt className="eyebrow">Status</dt>
+                  <dt className="eyebrow">Delivery</dt>
                   <span className="leader" aria-hidden="true" />
-                  <dd className="font-mono text-[11px] uppercase tracking-[0.06em] text-ink">
-                    {selected.status || (selectedAcknowledged ? 'acknowledged' : 'pending')}
+                  <dd className={cx('max-w-[65%] text-right font-mono text-[11px]', selectedDelivery?.tone)}>
+                    {selectedDelivery?.text}
                   </dd>
                 </div>
-                <div className="ledger py-2.5">
-                  <dt className="eyebrow">Channels sent</dt>
-                  <span className="leader" aria-hidden="true" />
-                  <dd className="text-right font-mono text-[11px] text-ink">
-                    {Array.isArray(selected.sent_channels) && selected.sent_channels.length
-                      ? selected.sent_channels.join(', ')
-                      : '—'}
-                  </dd>
-                </div>
-                <div className="ledger py-2.5">
-                  <dt className="eyebrow">Escalations</dt>
-                  <span className="leader" aria-hidden="true" />
-                  <dd className="text-right font-mono text-[11px] text-ink">
-                    {Array.isArray(selected.escalations) && selected.escalations.length
-                      ? selected.escalations.map((step) => step.channel || step.level).join(', ')
-                      : 'None'}
-                  </dd>
-                </div>
+                {selected.acknowledged_at && (
+                  <div className="ledger py-2.5">
+                    <dt className="eyebrow">Acknowledged at</dt>
+                    <span className="leader" aria-hidden="true" />
+                    <dd className="font-mono text-[11px] text-ink">
+                      {formatDateTime(selected.acknowledged_at)}
+                    </dd>
+                  </div>
+                )}
+                {selectedEscalations.length > 0 && (
+                  <div className="ledger py-2.5">
+                    <dt className="eyebrow">Escalations</dt>
+                    <span className="leader" aria-hidden="true" />
+                    <dd className="text-right font-mono text-[11px] text-ink">
+                      {selectedEscalations.join(', ')}
+                    </dd>
+                  </div>
+                )}
               </dl>
 
               {!selectedAcknowledged && (

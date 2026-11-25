@@ -17,6 +17,14 @@ from config.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_MIN_CONFIDENCE = 85.0
+MIN_BOX_WIDTH = 0.04
+MIN_BOX_HEIGHT = 0.10
+MIN_BOX_AREA = 0.005
+MAX_BOX_AREA = 0.92
+MIN_ASPECT_RATIO = 0.12
+MAX_ASPECT_RATIO = 2.5
+
 _client = None
 _lock = threading.Lock()
 
@@ -67,7 +75,10 @@ class AWSRekognitionService:
             return None
         try:
             client = _get_client()
-            min_conf = float(self.settings.rekognition_min_confidence)
+            min_conf = float(
+                getattr(self.settings, "rekognition_min_confidence", DEFAULT_MIN_CONFIDENCE)
+                or DEFAULT_MIN_CONFIDENCE
+            )
             response = client.detect_labels(
                 Image={"Bytes": image_bytes},
                 MaxLabels=25,
@@ -81,15 +92,27 @@ class AWSRekognitionService:
                     box = instance.get("BoundingBox") or {}
                     if not box:
                         continue
-                    inst_conf = float(instance.get("Confidence") or label.get("Confidence") or 0.0)
+                    raw_conf = instance.get("Confidence")
+                    if raw_conf is None:
+                        raw_conf = label.get("Confidence")
+                    inst_conf = float(raw_conf or 0.0)
                     if inst_conf < min_conf:
                         continue
                     x1 = float(box.get("Left", 0.0) or 0.0)
                     y1 = float(box.get("Top", 0.0) or 0.0)
                     w = float(box.get("Width", 0.0) or 0.0)
                     h = float(box.get("Height", 0.0) or 0.0)
-                    # Require a non-trivial bounding box so tiny noise/reflections/edge slivers are ignored
-                    if w < 0.025 or h < 0.05 or (w * h) < 0.0015:
+                    area = w * h
+                    # Reject tiny reflections, furniture slivers, and full-frame artifacts
+                    if (
+                        w < MIN_BOX_WIDTH
+                        or h < MIN_BOX_HEIGHT
+                        or area < MIN_BOX_AREA
+                        or area > MAX_BOX_AREA
+                    ):
+                        continue
+                    aspect = w / h
+                    if aspect < MIN_ASPECT_RATIO or aspect > MAX_ASPECT_RATIO:
                         continue
                     persons.append(
                         {
@@ -111,7 +134,7 @@ class AWSRekognitionService:
             }
         except Exception as error:  # noqa: BLE001
             self._error = str(error)
-            logger.warning("Rekognition detection failed, using OpenCV fallback: %s", error)
+            logger.error("AWS Rekognition detection failed: %s", error)
             return None
 
 

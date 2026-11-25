@@ -22,11 +22,27 @@ from config.settings import Settings, get_settings
 from models import Alert, Entry, Interaction
 from services.mongodb_handler import DataStoreError, MongoHandler
 from services.settings_service import SettingsService
-from utils.helpers import current_time, to_iso, to_local, utcnow
+from utils.helpers import format_local_datetime, to_iso, utcnow
 
 logger = logging.getLogger(__name__)
 
 FCM_SCOPE = "https://www.googleapis.com/auth/firebase.messaging"
+
+
+def _format_count(count: int, singular: str, plural: str) -> str:
+    number = int(count)
+    return f"{number} {singular if number == 1 else plural}"
+
+
+def _format_camera_label(channel: int | None, location: str | None = None) -> str:
+    loc = (location or "").strip()
+    if loc and channel is not None:
+        return f"{loc} (CH {int(channel):02d})"
+    if loc:
+        return loc
+    if channel is not None:
+        return f"Camera {int(channel):02d}"
+    return "Camera"
 
 
 class AlertSystem:
@@ -182,11 +198,14 @@ class AlertSystem:
         html_body: str,
         snapshot_url: str | None = None,
         channel: int | None = None,
+        include_channel_in_subject: bool = True,
     ) -> dict[str, Any]:
+        subject = f"[Sentinel AI] {title}"
+        if include_channel_in_subject and channel is not None:
+            subject += f" - Camera {channel:02d}"
         return {
             "email": self.send_email(
-                subject=f"[Sentinel AI] {title}"
-                + (f" - Camera {channel:02d}" if channel else ""),
+                subject=subject,
                 html_body=html_body,
             ),
             "push": self.send_push(
@@ -201,32 +220,28 @@ class AlertSystem:
         self,
         entry: Entry,
         snapshot_url: str | None = None,
-        is_repeat: bool = False,
+        detected_at: datetime | None = None,
     ) -> Alert:
+        event_time = detected_at or entry.created_at or utcnow()
         after_hours = "after hours" if entry.after_hours else "during working hours"
-        if is_repeat:
-            title = "Person still present after hours (3-min follow-up)"
-        else:
-            title = (
-                "Unauthorized after-hours entry"
-                if entry.after_hours and not entry.authorized
-                else "Warehouse entry detected (after hours)"
-                if entry.after_hours
-                else "Warehouse entry detected"
-            )
-        local_time = current_time().strftime("%d %b %Y, %H:%M:%S")
         location_text = (entry.entry_location or "").strip()
-        location_suffix = f" Location: {location_text}." if location_text else ""
-        if is_repeat:
-            message = (
-                f"{entry.person_count} person(s) still present on Camera {entry.channel:02d} "
-                f"{after_hours} at {local_time} (3-minute follow-up). Snapshot attached.{location_suffix}"
-            )
+        camera_label = _format_camera_label(entry.channel, location_text)
+        people_text = _format_count(entry.person_count, "person", "people")
+        local_time = format_local_datetime(event_time)
+
+        if entry.after_hours and not entry.authorized:
+            title = f"Unauthorized after-hours entry — {camera_label}"
+        elif entry.after_hours:
+            title = f"After-hours entry — {camera_label}"
         else:
-            message = (
-                f"{entry.person_count} person(s) detected on Camera {entry.channel:02d} "
-                f"{after_hours} at {local_time}. Snapshot attached.{location_suffix}"
-            )
+            title = f"Room entry detected — {camera_label}"
+
+        preposition = "in" if location_text else "on"
+        snapshot_note = " Snapshot attached." if snapshot_url else ""
+        message = (
+            f"{people_text} detected {preposition} {camera_label} "
+            f"{after_hours} at {local_time}.{snapshot_note}"
+        )
         severity = (
             "critical"
             if entry.after_hours and not entry.authorized
@@ -235,53 +250,77 @@ class AlertSystem:
             else "info"
         )
         owner = self._owner()
-        delivery = self._deliver(
-            title,
-            message,
-            severity,
-            self._warehouse_email_html(message, entry, snapshot_url),
-            snapshot_url=snapshot_url,
-            channel=entry.channel,
-        )
+        metadata: dict[str, Any] = {
+            "entry_id": entry.id,
+            "authorized": entry.authorized,
+            "after_hours": entry.after_hours,
+            "person_count": entry.person_count,
+            "snapshot_url": snapshot_url,
+            "camera_label": camera_label,
+        }
+        if location_text:
+            metadata["location"] = location_text
+            metadata["entry_location"] = location_text
 
+        # Persist the alert with the exact frame capture timestamp BEFORE any network I/O.
         alert = Alert(
             type="warehouse_entry",
             title=title,
             message=message,
             severity=severity,
             channel=entry.channel,
-            delivery=delivery,
+            delivery={},
+            status="PENDING",
             owner_id="owner_001",
             owner_email=owner.get("email", ""),
             snapshot=snapshot_url,
-            metadata={
-                "entry_id": entry.id,
-                "authorized": entry.authorized,
-                "after_hours": entry.after_hours,
-                "person_count": entry.person_count,
-                "snapshot_url": snapshot_url,
-                "entry_location": entry.entry_location,
-            },
+            metadata=metadata,
+            created_at=event_time,
         )
 
         try:
             self.store.insert_alert(alert)
+        except DataStoreError as error:
+            logger.error("Could not persist alert: %s", error)
+
+        self._publish("alert.created", alert)
+
+        delivery = self._deliver(
+            title,
+            message,
+            severity,
+            self._warehouse_email_html(message, entry, snapshot_url, event_time=event_time),
+            snapshot_url=snapshot_url,
+            channel=entry.channel,
+            include_channel_in_subject=False,
+        )
+        alert.apply_delivery(delivery)
+
+        try:
+            if hasattr(self.store, "update_alert_delivery"):
+                self.store.update_alert_delivery(
+                    alert.id,
+                    delivery=alert.delivery,
+                    sent_channels=alert.sent_channels,
+                    status=alert.status,
+                )
             self.store.update_entry_alert(
                 entry.id,
                 channels=alert.sent_channels,
                 severity=severity,
+                alert_sent=bool(alert.sent_channels),
             )
-            entry.alert_sent = bool(alert.id)
+            entry.alert_sent = bool(alert.sent_channels)
             entry.alert_channel = list(alert.sent_channels)
         except DataStoreError as error:
-            logger.error("Could not persist alert: %s", error)
+            logger.error("Could not update alert delivery state: %s", error)
 
         self.store.log(
             "warning",
-            f"Warehouse alert raised on channel {entry.channel}",
+            f"Room entry alert raised for {camera_label}",
             {"alert_id": alert.id, "delivery": delivery},
         )
-        self._publish("alert.created", alert)
+        self._publish("alert.updated", alert)
         return alert
 
     def create_unattended_alert(
@@ -289,28 +328,26 @@ class AlertSystem:
         interaction: Interaction,
         snapshot_url: str | None = None,
     ) -> Alert:
+        event_time = interaction.created_at or utcnow()
         title = "Unattended customer at the shop"
+        customer_text = _format_count(
+            interaction.customer_count or interaction.person_count,
+            "customer",
+            "customers",
+        )
         message = (
-            f"{interaction.customer_count or interaction.person_count} customer(s) "
-            f"detected on camera {interaction.channel} without a shopkeeper for "
-            f"{round(interaction.duration_seconds)} seconds."
+            f"{customer_text} detected on Camera {interaction.channel:02d} "
+            f"without a shopkeeper for {round(interaction.duration_seconds)} seconds."
         )
         owner = self._owner()
-        delivery = self._deliver(
-            title,
-            message,
-            "critical",
-            self._unattended_email_html(message, interaction, snapshot_url),
-            snapshot_url=snapshot_url,
-            channel=interaction.channel,
-        )
         alert = Alert(
             type="unattended_customer",
             title=title,
             message=message,
             severity="critical",
             channel=interaction.channel,
-            delivery=delivery,
+            delivery={},
+            status="PENDING",
             owner_id="owner_001",
             owner_email=owner.get("email", ""),
             snapshot=snapshot_url,
@@ -320,17 +357,39 @@ class AlertSystem:
                 "duration_seconds": interaction.duration_seconds,
                 "snapshot_url": snapshot_url,
             },
+            created_at=event_time,
         )
         try:
             self.store.insert_alert(alert)
         except DataStoreError as error:
             logger.error("Could not persist unattended alert: %s", error)
+        self._publish("alert.created", alert)
+
+        delivery = self._deliver(
+            title,
+            message,
+            "critical",
+            self._unattended_email_html(message, interaction, snapshot_url),
+            snapshot_url=snapshot_url,
+            channel=interaction.channel,
+        )
+        alert.apply_delivery(delivery)
+        try:
+            if hasattr(self.store, "update_alert_delivery"):
+                self.store.update_alert_delivery(
+                    alert.id,
+                    delivery=alert.delivery,
+                    sent_channels=alert.sent_channels,
+                    status=alert.status,
+                )
+        except DataStoreError as error:
+            logger.error("Could not update unattended alert delivery: %s", error)
         self.store.log(
             "warning",
             "Unattended customer alert raised",
             {"alert_id": alert.id, "interaction_id": interaction.id},
         )
-        self._publish("alert.created", alert)
+        self._publish("alert.updated", alert)
         return alert
 
     def create_greeting_report_alert(
@@ -338,7 +397,12 @@ class AlertSystem:
         report,
         delivery: dict[str, Any] | None = None,
     ) -> Alert:
-        title = f"{report.missed_greetings} missed greeting(s) yesterday"
+        missed_text = _format_count(
+            report.missed_greetings,
+            "missed greeting",
+            "missed greetings",
+        )
+        title = f"{missed_text} yesterday"
         message = (
             f"Daily shop report for {report.date}: {report.successful_greetings} "
             f"greeted, {report.missed_greetings} missed, {report.unattended_customers} "
@@ -422,7 +486,7 @@ class AlertSystem:
         shop = summary.get("shop", {})
         warehouse = summary.get("warehouse", {})
         alerts = summary.get("alerts", {})
-        generated = datetime.now().strftime("%d %b %Y, %H:%M")
+        generated = format_local_datetime(utcnow())
 
         rows = [
             ("Customers greeted", f"{shop.get('greeted', 0)} of {shop.get('total_interactions', 0)}"),
@@ -485,6 +549,7 @@ class AlertSystem:
         message: str,
         entry: Entry,
         snapshot_url: str | None,
+        event_time: datetime | None = None,
     ) -> str:
         snapshot = (
             f"<img src='{html.escape(snapshot_url)}' alt='Snapshot' "
@@ -492,17 +557,13 @@ class AlertSystem:
             if snapshot_url
             else ""
         )
-        local_dt = to_local(entry.created_at) or current_time()
-        formatted_time = local_dt.strftime("%d %b %Y, %H:%M:%S")
-        meta_parts = [f"Camera {entry.channel:02d}"]
-        if (entry.entry_location or "").strip():
-            meta_parts.append(entry.entry_location.strip())
-        meta_parts.append(formatted_time)
-        meta_line = " - ".join(meta_parts)
+        formatted_time = format_local_datetime(event_time or entry.created_at)
+        camera_label = _format_camera_label(entry.channel, entry.entry_location)
+        meta_line = f"{camera_label} · {formatted_time}"
         return f"""
         <div style="font-family:Arial,sans-serif;max-width:560px;margin:auto">
           <div style="background:#fee2e2;color:#991b1b;padding:16px 20px;border-radius:12px">
-            <h2 style="margin:0">Warehouse security alert</h2>
+            <h2 style="margin:0">Security alert — {html.escape(camera_label)}</h2>
           </div>
           <p style="color:#334155;font-size:15px">{html.escape(message)}</p>
           <p style="color:#64748b;font-size:13px">
@@ -527,6 +588,7 @@ class AlertSystem:
             if snapshot_url
             else ""
         )
+        formatted_time = format_local_datetime(interaction.created_at)
         return f"""
         <div style="font-family:Arial,sans-serif;max-width:560px;margin:auto">
           <div style="background:#fee2e2;color:#991b1b;padding:16px 20px;border-radius:12px">
@@ -534,7 +596,7 @@ class AlertSystem:
           </div>
           <p style="color:#334155;font-size:15px">{html.escape(message)}</p>
           <p style="color:#64748b;font-size:13px">
-            Camera {interaction.channel} - {html.escape(to_iso(interaction.created_at) or "")}
+            Camera {interaction.channel:02d} · {html.escape(formatted_time)}
           </p>
           {snapshot}
           <p style="color:#94a3b8;font-size:12px;margin-top:24px">

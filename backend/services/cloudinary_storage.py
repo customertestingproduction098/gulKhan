@@ -110,6 +110,7 @@ class CloudinaryStorage:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             public_id = f"{prefix}_{timestamp}"
             folder = getattr(self.settings, "cloudinary_folder", "sentinel-ai/snapshots")
+            timeout = max(1, int(getattr(self.settings, "cloudinary_timeout_seconds", 15) or 15))
 
             response: dict[str, Any] = cloudinary.uploader.upload(
                 io.BytesIO(image_bytes),
@@ -117,6 +118,7 @@ class CloudinaryStorage:
                 public_id=public_id,
                 resource_type="image",
                 overwrite=True,
+                timeout=timeout,
             )
             secure_url = response.get("secure_url")
             if secure_url:

@@ -15,7 +15,8 @@ import {
 } from 'recharts'
 import { IconAlert, IconCheck, IconDownload } from '../components/Icons'
 import { interactionApi, reportApi } from '../services/api'
-import { cx, formatDate, formatTime, percent } from '../utils/helpers'
+import { cx, percent } from '../utils/helpers'
+import { formatDate, formatTime } from '../utils/time'
 
 const RANGES = [
   { label: '7 days', value: 7 },

@@ -3,7 +3,8 @@ import { useDispatch, useSelector } from 'react-redux'
 import { toast } from 'react-toastify'
 import { entryApi, settingsApi } from '../services/api'
 import { acknowledgeAlert, fetchAlerts } from '../store/slices/alertSlice'
-import { cx, formatTime, getApiBase, timeAgo } from '../utils/helpers'
+import { cx, getApiBase } from '../utils/helpers'
+import { formatTime, timeAgo } from '../utils/time'
 import AlertLog from './AlertLog'
 import { IconRefresh, IconShield } from './Icons'
 
@@ -70,7 +71,7 @@ export default function Dashboard() {
 
   const warehouse = settings?.warehouse || {}
   const startTime = warehouse.after_hours_start || '21:00'
-  const endTime = warehouse.after_hours_end || '11:00'
+  const endTime = warehouse.after_hours_end || '06:00'
   const notificationEmail =
     settings?.owner?.notification_email ||
     owner?.notification_email ||
@@ -239,6 +240,13 @@ export default function Dashboard() {
                             ? `${entry.person_count} ${entry.person_count === 1 ? 'person' : 'people'}`
                             : 'Count unavailable'}
                         </span>
+                        {(entry.entry_location || entry.channel != null) && (
+                          <span className="font-mono text-[10px] uppercase tracking-[0.06em] text-ink-faint">
+                            {entry.entry_location
+                              ? `${entry.entry_location} (CH ${String(entry.channel).padStart(2, '0')})`
+                              : `CH ${String(entry.channel).padStart(2, '0')}`}
+                          </span>
+                        )}
                         <span className="font-mono text-[10px] uppercase tracking-[0.06em] text-ink-faint">
                           {entry.alert_sent ? 'Emailed to owner' : 'Not emailed'}
                         </span>

@@ -38,6 +38,7 @@ def _camera_statuses() -> list[dict]:
             {
                 "channel": channel,
                 "name": camera.get("name") or f"Camera {channel:02d}",
+                "location": camera.get("location") or "",
                 "enabled": bool(camera.get("enabled", True)),
                 "connected": bool(status.get("connected")),
                 "monitoring": channel in active_chs,

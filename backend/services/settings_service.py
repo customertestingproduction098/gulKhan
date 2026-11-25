@@ -29,9 +29,6 @@ from utils.helpers import (
 logger = logging.getLogger(__name__)
 
 USERNAME_PATTERN = re.compile(r"^[a-zA-Z0-9._-]{3,40}$")
-OPERATIONS_REVISION = 2
-AFTER_HOURS_START = "21:00"
-AFTER_HOURS_END = "11:00"
 
 
 class SettingsService:
@@ -55,7 +52,6 @@ class SettingsService:
     def _defaults(self) -> dict[str, Any]:
         return {
             "auth_seeded": False,
-            "operations_revision": 0,
             "owner": {
                 "id": "owner_001",
                 "name": self.settings.owner_name,
@@ -94,7 +90,12 @@ class SettingsService:
                 "staff_presence_seconds": self.settings.staff_presence_seconds,
             },
             "cameras": [
-                {"channel": channel, "name": f"Camera {channel:02d}", "enabled": True}
+                {
+                    "channel": channel,
+                    "name": f"Camera {channel:02d}",
+                    "location": "",
+                    "enabled": True,
+                }
                 for channel in self.settings.allowed_cameras
             ],
             "reports": {
@@ -130,6 +131,13 @@ class SettingsService:
                 cur_owner["notification_email"] = getattr(self.settings, "notification_email", "alerts@client.com")
             if "secondary_email" not in cur_owner:
                 cur_owner["secondary_email"] = "" 
+            if not str(cur_owner.get("password_hash") or "").strip():
+                # Hash once and persist; otherwise every 5s cache refresh re-runs scrypt
+                # on the detection thread and stalls entry capture.
+                cur_owner["password_hash"] = generate_password_hash(
+                    str(cur_owner.get("password") or self.settings.owner_password)
+                )
+                seeded = True
             if not merged.get("auth_seeded"):
                 owner = merged.setdefault("owner", {})
                 owner["email"] = self.settings.owner_email
@@ -139,20 +147,6 @@ class SettingsService:
                     self.settings.owner_password
                 )
                 merged["auth_seeded"] = True
-                seeded = True
-
-            try:
-                revision = int(merged.get("operations_revision") or 0)
-            except (TypeError, ValueError):
-                revision = 0
-            if revision < OPERATIONS_REVISION:
-                warehouse = merged.setdefault("warehouse", {})
-                if revision < 1:
-                    warehouse["after_hours_start"] = AFTER_HOURS_START
-                    warehouse["after_hours_end"] = AFTER_HOURS_END
-                if str(warehouse.get("entry_location") or "").strip().lower() == "main_gate":
-                    warehouse["entry_location"] = ""
-                merged["operations_revision"] = OPERATIONS_REVISION
                 seeded = True
 
             normalized = self._normalize(merged)
@@ -171,8 +165,16 @@ class SettingsService:
 
         with self._lock:
             current = self.get(force=True)
+            old_password = str((current.get("owner") or {}).get("password") or "")
+            supplied_owner = payload.get("owner") if isinstance(payload.get("owner"), dict) else {}
+            supplied_password = supplied_owner.get("password")
+            password_changed = (
+                supplied_password is not None
+                and str(supplied_password) != ""
+                and str(supplied_password) != old_password
+            )
             merged = self._merge(current, payload)
-            normalized = self._normalize(merged)
+            normalized = self._normalize(merged, rehash_password=password_changed)
             saved = self.store.save_owner_settings(normalized)
             normalized = self._normalize(self._merge(normalized, saved or {}))
             self._cached = normalized
@@ -374,7 +376,12 @@ class SettingsService:
                 merged[key] = value
         return merged
 
-    def _normalize(self, data: dict[str, Any]) -> dict[str, Any]:
+    def _normalize(
+        self,
+        data: dict[str, Any],
+        *,
+        rehash_password: bool = False,
+    ) -> dict[str, Any]:
         defaults = self._defaults()
         owner = data.get("owner") or {}
         shop = data.get("shop") or {}
@@ -408,7 +415,8 @@ class SettingsService:
         plain_password = str(owner.get("password") or "")
         if new_password is not None and str(new_password) != "":
             plain_password = str(new_password)
-            password_hash = generate_password_hash(plain_password)
+            if rehash_password or not password_hash:
+                password_hash = generate_password_hash(plain_password)
         if not password_hash:
             password_hash = self._default_password_hash
 
@@ -444,7 +452,6 @@ class SettingsService:
 
         normalized = {
             "auth_seeded": bool(data.get("auth_seeded")),
-            "operations_revision": int(data.get("operations_revision") or 0),
             "owner": {
                 "id": str(owner.get("id") or "owner_001")[:80],
                 "name": str(owner.get("name") or self.settings.owner_name)[:120],
@@ -565,11 +572,10 @@ class SettingsService:
             item = supplied.get(channel, {})
             entry = {
                 "channel": channel,
-                "name": str(item.get("name") or f"Camera {channel:02d}")[:80],
+                "name": str(item.get("name") or f"Camera {channel:02d}").strip()[:80],
+                "location": str(item.get("location") or "").strip()[:80],
                 "enabled": bool(item.get("enabled", True)),
             }
-            if item.get("location"):
-                entry["location"] = str(item.get("location")).strip()[:80]
             normalized.append(entry)
         return normalized
 

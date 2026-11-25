@@ -12,7 +12,8 @@ import {
   startMonitoring,
   stopMonitoring,
 } from '../store/slices/cameraSlice'
-import { MONITOR_MODES, cx, formatTime, timeAgo } from '../utils/helpers'
+import { MONITOR_MODES, cx } from '../utils/helpers'
+import { formatTime, timeAgo } from '../utils/time'
 
 function Verdict({ entry }) {
   if (entry.false_alarm) return <span className="tag text-ink-faint">False alarm</span>
@@ -148,8 +149,8 @@ export default function Warehouse() {
             After-hours watch
           </h1>
           <p className="mt-3 max-w-2xl text-sm leading-relaxed text-ink-soft">
-            Anyone detected outside working hours is recorded and emailed to you. Unacknowledged
-            alerts escalate to your second contact.
+            New room entries outside working hours are captured immediately and emailed to you with
+            a snapshot.
           </p>
         </div>
       </header>
@@ -160,7 +161,7 @@ export default function Warehouse() {
           <p className="mt-3 font-mono text-[22px] font-bold leading-none tabular-nums text-ochre">
             {status?.after_hours?.start ?? '21:00'}
             <span className="px-1 text-ink-faint">–</span>
-            {status?.after_hours?.end ?? '11:00'}
+            {status?.after_hours?.end ?? '06:00'}
           </p>
           <p className="note mt-3">
             {status?.after_hours?.active ? 'Inside the window now' : 'Outside the window now'}
@@ -240,8 +241,10 @@ export default function Warehouse() {
                       {formatTime(entry.timestamp || entry.created_at)}
                     </span>
                     <span className="font-mono text-[10px] uppercase tracking-[0.06em] text-ink-faint">
-                      {timeAgo(entry.timestamp || entry.created_at)} · CH{' '}
-                      {entry.channel != null ? String(entry.channel).padStart(2, '0') : '—'}
+                      {timeAgo(entry.timestamp || entry.created_at)} ·{' '}
+                      {entry.entry_location
+                        ? `${entry.entry_location} (CH ${entry.channel != null ? String(entry.channel).padStart(2, '0') : '—'})`
+                        : `CH ${entry.channel != null ? String(entry.channel).padStart(2, '0') : '—'}`}
                     </span>
                     <span className="ml-auto flex flex-wrap items-center gap-1.5">
                       {entry.after_hours && <span className="tag tag-ochre">After hours</span>}

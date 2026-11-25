@@ -119,6 +119,17 @@ class MongoHandler:
         self._db[DAILY_REPORTS].create_index([("date", 1)], unique=True)
         self._db[LOGS].create_index([("created_at", DESCENDING)])
         self._db[REPORT_RUNS].create_index([("created_at", DESCENDING)])
+        self._sanitize_legacy_locations()
+
+    def _sanitize_legacy_locations(self) -> None:
+        """One-time best-effort cleanup of legacy placeholder locations in MongoDB."""
+        assert self._db is not None
+        try:
+            from scripts.cleanup_legacy_locations import sanitize_database
+
+            sanitize_database(self._db)
+        except Exception as error:  # noqa: BLE001 - never block DB startup
+            logger.debug("Skipping legacy location sanitization: %s", error)
 
     @property
     def db(self):
@@ -205,16 +216,42 @@ class MongoHandler:
         except PyMongoError as error:
             raise DataStoreError(str(error)) from error
 
+    def update_alert_delivery(
+        self,
+        alert_id: str | None,
+        *,
+        delivery: dict[str, Any],
+        sent_channels: Iterable[str],
+        status: str,
+    ) -> None:
+        identifier = object_id(alert_id)
+        if identifier is None:
+            return
+        try:
+            self.db[ALERTS].update_one(
+                {"_id": identifier},
+                {
+                    "$set": {
+                        "delivery": delivery,
+                        "sent_channels": sorted(set(sent_channels)),
+                        "status": status,
+                    }
+                },
+            )
+        except PyMongoError:
+            logger.debug("Could not update delivery for alert %s", alert_id)
+
     def update_entry_alert(
         self,
         entry_id: str | None,
         channels: Iterable[str] | None = None,
         severity: str | None = None,
+        alert_sent: bool = True,
     ) -> None:
         identifier = object_id(entry_id)
         if identifier is None:
             return
-        update: dict[str, Any] = {"alert_sent": True}
+        update: dict[str, Any] = {"alert_sent": bool(alert_sent)}
         if channels is not None:
             update["alert_channel"] = sorted(set(channels))
         if severity:

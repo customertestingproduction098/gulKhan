@@ -45,6 +45,8 @@ desktop.ini
 
 # Data dumps
 mongodb-dump/
+repomix-output.xml
+*.xml
 
 # Local log captures
 error*.txt

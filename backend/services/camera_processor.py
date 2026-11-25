@@ -7,13 +7,14 @@ Two cooperating pieces live here:
   delayed in FFmpeg/TCP buffers, and exposes the latest live frame.
 * ``SurveillanceProcessor`` monitors ALL enabled cameras in parallel (one worker
   thread per camera channel), runs instant motion-triggered + periodic person
-  detection (AWS Rekognition with OpenCV HOG fallback), captures the exact frame
-  where the person is detected, and dispatches one single email per intrusion.
+  detection via AWS Rekognition, tracks active occupants per channel, and
+  dispatches non-blocking alerts only on positive entry deltas.
 """
 
 from __future__ import annotations
 
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor, wait as wait_futures
 from dataclasses import dataclass, field
 from datetime import datetime
 import logging
@@ -23,11 +24,11 @@ import threading
 import time
 from typing import Any
 
-# Configure FFmpeg RTSP options for robust network streaming and HEVC/H.264 error resilience
+# Configure FFmpeg RTSP options for live-edge streaming with zero reorder buffering
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
     "rtsp_transport;tcp"
-    "|max_delay;500000"
-    "|reorder_queue_size;10"
+    "|max_delay;200000"
+    "|reorder_queue_size;0"
     "|fflags;nobuffer+discardcorrupt"
     "|flags;low_delay"
     "|ec;favor_inter"
@@ -40,14 +41,13 @@ from config.settings import Settings, get_settings
 from models import Entry, Interaction
 from models.interaction import TYPE_MISSED, TYPE_SUCCESSFUL, TYPE_UNATTENDED
 from services.alert_system import AlertSystem
-from services.aws_rekognition import get_vision_service
+from services.aws_rekognition import DEFAULT_MIN_CONFIDENCE, get_vision_service
 from services.cloudinary_storage import get_cloudinary_storage
 from services.events import EventBroker
 from services.mongodb_handler import DataStoreError, MongoHandler
 from services.openrouter import get_openrouter_service
 from services.settings_service import SettingsService
 from utils.helpers import (
-    current_time,
     is_after_hours,
     serialize_doc,
     to_iso,
@@ -62,8 +62,7 @@ VALID_MODES = {MODE_SHOP, MODE_WAREHOUSE}
 
 SHOP_ABSENCE_GRACE_SECONDS = 2.5
 WAREHOUSE_ABSENCE_GRACE_SECONDS = 8.0
-WAREHOUSE_REALERT_SECONDS = 180.0
-FAST_POLL_SECONDS = 0.10
+FAST_POLL_SECONDS = 0.05
 MOTION_MIN_INTERVAL_SECONDS = 0.25
 WAREHOUSE_IDLE_PERIODIC_SECONDS = 5.0
 WAREHOUSE_PRESENT_PERIODIC_SECONDS = 2.0
@@ -96,16 +95,13 @@ class _ChannelMonitorState:
     person_present_since: float | None = None
     staff_established: bool = False
 
-    # Warehouse state (strictly per-camera)
-    warehouse_present: bool = False
-    warehouse_alert_sent: bool = False
-    warehouse_last_alert_mono: float = 0.0
-    warehouse_cooldown_until: float = 0.0
-    warehouse_empty_since: float | None = None
-    dispatching_alert: bool = False
+    # Warehouse occupant state (strictly per-camera)
+    active_occupants: int = 0
+    occupant_absent_since: dict[int, float] = field(default_factory=dict)
 
     # Motion & timing state
     prev_gray: Any = None
+    last_had_motion: bool = False
     last_detection_mono: float = 0.0
     last_frame_revision: int = -1
 
@@ -120,6 +116,7 @@ class FrameGrabber:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
+        self._frame_cond = threading.Condition(self._lock)
         self._first_frame = threading.Event()
         self._jpeg: bytes | None = None
         self._frame = None
@@ -150,6 +147,8 @@ class FrameGrabber:
 
     def stop(self) -> None:
         self._stop.set()
+        with self._frame_cond:
+            self._frame_cond.notify_all()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3)
         self._release()
@@ -192,7 +191,7 @@ class FrameGrabber:
     def _capture_loop(self) -> None:
         retry_delay = 3.0
         stream_decode_interval = 1.0 / max(1, min(self.settings.camera_fps, 25))
-        monitor_decode_interval = 1.0 / min(max(1, self.settings.camera_fps), 6)
+        monitor_decode_interval = 1.0 / min(max(1, self.settings.camera_fps), 8)
         last_decode = 0.0
         consecutive_fast_grabs = 0
 
@@ -216,7 +215,7 @@ class FrameGrabber:
             # If grab() returned almost instantaneously (<4ms), packets were queued
             # in FFmpeg/TCP receive buffers. Drain queued stale packets until we
             # reach the live edge before decoding.
-            if grab_elapsed < 0.004 and self._frame is not None and consecutive_fast_grabs < 20:
+            if grab_elapsed < 0.004 and self._frame is not None and consecutive_fast_grabs < 60:
                 consecutive_fast_grabs += 1
                 continue
             consecutive_fast_grabs = 0
@@ -231,6 +230,7 @@ class FrameGrabber:
             if not ret or frame is None:
                 continue
 
+            captured_at = utcnow()
             last_decode = now
 
             if self.settings.frame_width and frame.shape[1] > self.settings.frame_width:
@@ -241,18 +241,6 @@ class FrameGrabber:
                     interpolation=cv2.INTER_AREA,
                 )
 
-            stamp = current_time().strftime("%Y-%m-%d %H:%M:%S")
-            cv2.putText(
-                frame,
-                f"CAM {self.channel:02d}  {stamp}",
-                (12, 28),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (0, 255, 120),
-                2,
-                cv2.LINE_AA,
-            )
-
             jpeg: bytes | None = None
             if viewer_active:
                 ok, buffer = cv2.imencode(
@@ -261,15 +249,16 @@ class FrameGrabber:
                 if ok:
                     jpeg = buffer.tobytes()
 
-            with self._lock:
+            with self._frame_cond:
                 self._frame = frame
                 self._jpeg = jpeg
-                self._last_frame_at = utcnow()
+                self._last_frame_at = captured_at
                 self._frames += 1
                 self._revision += 1
                 if jpeg is not None:
                     self._buffer.append((now, jpeg))
                 self._first_frame.set()
+                self._frame_cond.notify_all()
 
             self._error = None
 
@@ -310,6 +299,22 @@ class FrameGrabber:
         with self._lock:
             frame = None if self._frame is None else self._frame.copy()
             return self._revision, frame
+
+    def wait_for_new_frame(
+        self,
+        last_revision: int,
+        timeout: float = 0.25,
+    ) -> tuple[int, Any, datetime | None]:
+        """Block until a frame newer than ``last_revision`` is available or timeout expires."""
+        self._last_access = time.monotonic()
+        with self._frame_cond:
+            if (
+                (self._frame is None or self._revision == last_revision)
+                and not self._stop.is_set()
+            ):
+                self._frame_cond.wait(timeout=timeout)
+            frame = None if self._frame is None else self._frame.copy()
+            return self._revision, frame, self._last_frame_at
 
     def recent_jpegs(self, seconds: float = 5.0) -> list[bytes]:
         cutoff = time.monotonic() - max(0.5, seconds)
@@ -421,8 +426,14 @@ class SurveillanceProcessor:
         self.cloudinary = get_cloudinary_storage()
 
         self._lock = threading.RLock()
-        self._hog_lock = threading.Lock()
+        self._monotonic = time.monotonic
         self._channel_states: dict[int, _ChannelMonitorState] = {}
+        self._dispatch_executor = ThreadPoolExecutor(
+            max_workers=8,
+            thread_name_prefix="warehouse-alert",
+        )
+        self._dispatch_lock = threading.Lock()
+        self._pending_dispatches: set[Future] = set()
 
         self.channel: int | None = None
         self.mode: str | None = None
@@ -434,9 +445,6 @@ class SurveillanceProcessor:
         self.customer_count = 0
         self.shopkeeper_present = True
         self.unattended_active = False
-
-        self._hog = cv2.HOGDescriptor()
-        self._hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
 
     # -------------------------------------------------------------- lifecycle
     @property
@@ -573,8 +581,30 @@ class SurveillanceProcessor:
             self.unattended_active = False
         return self.status()
 
+    def _submit_dispatch(self, fn, *args) -> Future:
+        future = self._dispatch_executor.submit(fn, *args)
+        with self._dispatch_lock:
+            self._pending_dispatches.add(future)
+
+        def _cleanup(done_future: Future) -> None:
+            with self._dispatch_lock:
+                self._pending_dispatches.discard(done_future)
+
+        future.add_done_callback(_cleanup)
+        return future
+
+    def wait_for_dispatches(self, timeout: float = 10.0) -> bool:
+        """Wait for all currently queued alert dispatches to complete."""
+        with self._dispatch_lock:
+            pending = list(self._pending_dispatches)
+        if not pending:
+            return True
+        _, not_done = wait_futures(pending, timeout=timeout)
+        return len(not_done) == 0
+
     def shutdown(self) -> None:
         self.stop()
+        self._dispatch_executor.shutdown(wait=False, cancel_futures=False)
         self.manager.shutdown()
 
     # ------------------------------------------------------------------- loop
@@ -598,63 +628,82 @@ class SurveillanceProcessor:
         grabber = self.manager.get(channel, autostart=True)
         logger.info("Analysis loop started for channel %s (%s)", channel, self.mode)
         shop_periodic_interval = max(1.0, min(float(self.settings.analysis_interval_seconds), 2.0))
+        supports_wait = hasattr(grabber, "wait_for_new_frame")
 
         while not state.stop_event.is_set():
             try:
-                rev, frame = grabber.read_frame_with_revision()
+                if supports_wait:
+                    rev, frame, frame_at = grabber.wait_for_new_frame(
+                        state.last_frame_revision,
+                        timeout=0.25,
+                    )
+                else:
+                    rev, frame = grabber.read_frame_with_revision()
+                    frame_at = None
+
                 if frame is None:
-                    grabber.wait_for_frame(timeout=1.5)
+                    if grabber.wait_for_frame(timeout=1.0):
+                        continue
                     state.last_error = grabber.status().get("error") or f"Waiting for camera {channel} frames"
                     self.last_error = state.last_error
-                    state.stop_event.wait(0.5)
+                    state.stop_event.wait(0.25)
                     continue
 
                 if rev == state.last_frame_revision:
-                    state.stop_event.wait(FAST_POLL_SECONDS)
+                    if not supports_wait:
+                        state.stop_event.wait(FAST_POLL_SECONDS)
                     continue
+
+                # Freeze exact frame and capture timestamp immediately on receipt.
+                detected_at = frame_at or utcnow()
+                captured_frame = frame.copy()
                 state.last_frame_revision = rev
 
-                # In warehouse mode, skip expensive vision calls outside after-hours
+                # In warehouse mode, skip vision calls outside after-hours.
                 if self.mode == MODE_WAREHOUSE:
                     hours = self.owner_settings.after_hours()
-                    if not is_after_hours(hours["start"], hours["end"]):
-                        state.warehouse_present = False
-                        state.warehouse_alert_sent = False
-                        state.warehouse_last_alert_mono = 0.0
-                        state.warehouse_empty_since = None
+                    if not is_after_hours(hours["start"], hours["end"], now=detected_at):
+                        state.active_occupants = 0
+                        state.occupant_absent_since.clear()
                         state.person_count = 0
-                        _, state.prev_gray = self._compute_motion(state.prev_gray, frame)
+                        state.last_had_motion = False
+                        _, state.prev_gray = self._compute_motion(state.prev_gray, captured_frame)
                         state.stop_event.wait(1.0)
                         continue
 
-                now = time.monotonic()
-                has_motion, state.prev_gray = self._compute_motion(state.prev_gray, frame)
+                now = self._monotonic()
+                has_motion, next_gray = self._compute_motion(state.prev_gray, captured_frame)
                 elapsed_since_detect = now - state.last_detection_mono
 
                 if self.mode == MODE_WAREHOUSE:
-                    if state.warehouse_present:
-                        periodic_interval = WAREHOUSE_PRESENT_PERIODIC_SECONDS
-                        motion_interval = 1.0
-                    else:
-                        # Stay idle on static empty rooms so motion triggers Rekognition
-                        # IMMEDIATELY instead of colliding with an in-flight empty-room call.
-                        periodic_interval = WAREHOUSE_IDLE_PERIODIC_SECONDS
-                        motion_interval = MOTION_MIN_INTERVAL_SECONDS
+                    periodic_interval = (
+                        WAREHOUSE_PRESENT_PERIODIC_SECONDS
+                        if state.active_occupants > 0
+                        else WAREHOUSE_IDLE_PERIODIC_SECONDS
+                    )
+                    motion_interval = MOTION_MIN_INTERVAL_SECONDS
                 else:
                     periodic_interval = shop_periodic_interval
                     motion_interval = MOTION_MIN_INTERVAL_SECONDS
 
+                # Trigger immediately on rising-edge motion without waiting for periodic timers.
+                motion_rising_edge = has_motion and not state.last_had_motion
                 should_detect = (
                     state.last_detection_mono == 0.0
-                    or elapsed_since_detect >= periodic_interval
+                    or motion_rising_edge
                     or (has_motion and elapsed_since_detect >= motion_interval)
+                    or elapsed_since_detect >= periodic_interval
                 )
 
+                # Only advance prev_gray when idle or actually analyzing so throttled motion
+                # frames never erase a real entry delta before analysis runs.
+                if should_detect or not has_motion:
+                    state.prev_gray = next_gray
+                    state.last_had_motion = has_motion
+
                 if should_detect:
-                    # Analyze the EXACT motion frame immediately with zero artificial delay
-                    # so brief appearances are captured on the exact frame where the person appears.
-                    state.last_detection_mono = time.monotonic()
-                    self._analyse_channel(channel, state, frame)
+                    state.last_detection_mono = self._monotonic()
+                    self._analyse_channel(channel, state, captured_frame, detected_at=detected_at)
                     state.last_error = None
                     if self.channel == channel:
                         self.last_error = None
@@ -663,8 +712,7 @@ class SurveillanceProcessor:
                 self.last_error = str(error)
                 logger.exception("Analysis tick failed on channel %s: %s", channel, error)
                 self.store.log("error", "Analysis tick failed", {"channel": channel, "error": str(error)})
-
-            state.stop_event.wait(FAST_POLL_SECONDS)
+                state.stop_event.wait(FAST_POLL_SECONDS)
 
         logger.info("Analysis loop stopped for channel %s", channel)
 
@@ -686,34 +734,43 @@ class SurveillanceProcessor:
         )
         image_bytes = buffer.tobytes() if ok else b""
 
-        result = None
-        if image_bytes and self.vision.available:
-            result = self.vision.detect_persons(image_bytes)
-            if result is None:
-                # Rekognition is configured/enabled but failed transiently (timeout/network).
-                # Do NOT fall back to OpenCV HOG which generates false positives on empty rooms.
-                return {
-                    "person_count": 0,
-                    "confidence": 0.0,
-                    "labels": [],
-                    "persons": [],
-                    "source": "aws-rekognition-error",
-                    "error": True,
-                }
-
-        if result is None:
-            count, confidence, persons = self._hog_detect(analysis_frame)
-            result = {
-                "person_count": count,
-                "confidence": confidence,
+        if not image_bytes:
+            logger.error("Failed to JPEG-encode frame for AWS Rekognition analysis")
+            return {
+                "person_count": 0,
+                "confidence": 0.0,
                 "labels": [],
-                "persons": persons,
-                "source": "opencv-hog",
+                "persons": [],
+                "source": "encode-error",
+                "error": True,
+            }
+
+        if not self.vision.available:
+            logger.error("AWS Rekognition is unavailable; skipping detection without fallback")
+            return {
+                "person_count": 0,
+                "confidence": 0.0,
+                "labels": [],
+                "persons": [],
+                "source": "aws-rekognition-unavailable",
+                "error": True,
+            }
+
+        result = self.vision.detect_persons(image_bytes)
+        if result is None:
+            logger.error("AWS Rekognition returned an error; skipping detection without fallback")
+            return {
+                "person_count": 0,
+                "confidence": 0.0,
+                "labels": [],
+                "persons": [],
+                "source": "aws-rekognition-error",
+                "error": True,
             }
 
         min_conf = getattr(self.settings, "rekognition_min_confidence", None)
         if min_conf is None:
-            min_conf = getattr(self.settings, "vision_min_confidence", 70.0)
+            min_conf = DEFAULT_MIN_CONFIDENCE
         min_ratio = float(min_conf) / 100.0
         persons = result.get("persons") if isinstance(result.get("persons"), list) else []
         valid_persons = [
@@ -730,62 +787,38 @@ class SurveillanceProcessor:
             result["confidence"] = 0.0
         return result
 
-    def _analyse_channel(self, channel: int, state: _ChannelMonitorState, frame) -> None:
-        # Keep an immutable copy of the exact frame being analyzed so that if a person
-        # is detected in this frame, this exact image is saved and emailed.
+    def _analyse_channel(
+        self,
+        channel: int,
+        state: _ChannelMonitorState,
+        frame,
+        detected_at: datetime | None = None,
+    ) -> None:
+        # Freeze exact entry frame and timestamp BEFORE running detection I/O.
+        exact_at = detected_at or utcnow()
         exact_frame = frame.copy()
         result = self._detect(exact_frame)
         person_count = int(result.get("person_count", 0))
-        now_utc = utcnow()
         serialized = serialize_doc(result)
 
         with self._lock:
             state.person_count = person_count
-            state.last_analysis_at = now_utc
+            state.last_analysis_at = exact_at
             state.last_result = serialized
-            self.last_analysis_at = now_utc
+            self.last_analysis_at = exact_at
             self.last_result = serialized
             self.person_count = sum(s.person_count for s in self._channel_states.values())
 
         if self.mode == MODE_SHOP:
             self._handle_shop_channel(channel, state, exact_frame, result)
         elif self.mode == MODE_WAREHOUSE:
-            self._handle_warehouse_channel(channel, state, exact_frame, result)
-
-    def _hog_detect(self, frame) -> tuple[int, float, list[dict[str, float]]]:
-        try:
-            resized = frame
-            if frame.shape[1] > 800:
-                scale = 800 / frame.shape[1]
-                resized = cv2.resize(frame, (800, int(frame.shape[0] * scale)))
-
-            gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-            with self._hog_lock:
-                rectangles, weights = self._hog.detectMultiScale(
-                    gray,
-                    winStride=(8, 8),
-                    padding=(8, 8),
-                    scale=1.05,
-                )
-            confidence = (
-                sum(float(weight) for weight in weights) / len(weights) if len(weights) else 0.0
+            self._handle_warehouse_channel(
+                channel,
+                state,
+                exact_frame,
+                result,
+                detected_at=exact_at,
             )
-            confidence = max(0.0, min(1.0, 0.5 + confidence / 2))
-            height, width = resized.shape[:2]
-            persons = [
-                {
-                    "x1": round(max(0.0, x / width), 4),
-                    "y1": round(max(0.0, y / height), 4),
-                    "x2": round(min(1.0, (x + w) / width), 4),
-                    "y2": round(min(1.0, (y + h) / height), 4),
-                    "score": round(confidence, 4),
-                }
-                for (x, y, w, h) in rectangles
-            ]
-            return len(rectangles), round(confidence, 4), persons
-        except Exception as error:  # noqa: BLE001
-            logger.debug("OpenCV person detection failed: %s", error)
-            return 0, 0.0, []
 
     # ------------------------------------------------------------------- shop
     def _handle_shop_channel(
@@ -1093,18 +1126,26 @@ class SurveillanceProcessor:
 
     # -------------------------------------------------------------- warehouse
     def _resolve_camera_location(self, channel: int) -> str:
-        """Return a camera-specific location only if explicitly configured."""
+        """Return the camera's configured room/location label, or empty if unset."""
         default_names = {f"camera {channel:02d}", f"camera {channel}"}
         for cam in self.owner_settings.cameras():
             if int(cam.get("channel", 0)) == int(channel):
                 loc = str(cam.get("location") or "").strip()
-                if loc and loc.lower() != "main_gate":
+                if loc:
                     return loc
                 name = str(cam.get("name") or "").strip()
-                if name and name.lower() not in default_names and name.lower() != "main_gate":
+                if name and name.lower() not in default_names:
                     return name
                 return ""
         return ""
+
+    def _absence_grace_seconds(self) -> float:
+        value = getattr(
+            self.settings,
+            "warehouse_absence_grace_seconds",
+            WAREHOUSE_ABSENCE_GRACE_SECONDS,
+        )
+        return max(0.0, float(WAREHOUSE_ABSENCE_GRACE_SECONDS if value is None else value))
 
     def _handle_warehouse_channel(
         self,
@@ -1112,137 +1153,132 @@ class SurveillanceProcessor:
         state: _ChannelMonitorState,
         frame,
         result: dict[str, Any],
+        detected_at: datetime | None = None,
     ) -> None:
+        event_time = detected_at or utcnow()
         hours = self.owner_settings.after_hours()
-        if not is_after_hours(hours["start"], hours["end"]):
-            # Security only runs during non-operational hours (21:00–11:00 PKT).
-            state.warehouse_present = False
-            state.warehouse_alert_sent = False
-            state.warehouse_last_alert_mono = 0.0
-            state.warehouse_empty_since = None
+        if not is_after_hours(hours["start"], hours["end"], now=event_time):
+            state.active_occupants = 0
+            state.occupant_absent_since.clear()
             return
 
         # Ignore transient detector errors so we neither send false alerts nor
-        # prematurely reset the 3-minute presence timer while someone is in the room.
+        # prematurely clear active_occupants while someone is in the room.
         if result.get("error"):
             return
 
         persons = result.get("persons") if isinstance(result.get("persons"), list) else []
-        person_count = int(result.get("person_count", 0))
+        detected_count = max(0, int(result.get("person_count", 0)))
         if not persons:
-            person_count = 0
-        now = time.monotonic()
+            detected_count = 0
 
-        if person_count == 0:
-            if state.warehouse_present:
-                if state.warehouse_empty_since is None:
-                    state.warehouse_empty_since = now
-                elif now - state.warehouse_empty_since >= WAREHOUSE_ABSENCE_GRACE_SECONDS:
-                    # Person has left the room; reset presence session and 3-minute timer.
-                    state.warehouse_present = False
-                    state.warehouse_alert_sent = False
-                    state.warehouse_last_alert_mono = 0.0
-                    state.warehouse_empty_since = None
-            else:
-                state.warehouse_empty_since = None
+        now = self._monotonic()
+        grace_seconds = self._absence_grace_seconds()
+
+        # Visible slots 1..detected_count are present -> clear their departure timers.
+        for slot in range(1, detected_count + 1):
+            state.occupant_absent_since.pop(slot, None)
+
+        if detected_count < state.active_occupants:
+            # Start/track departure timers per missing occupant slot without dropping
+            # active_occupants on brief occlusion or detector flicker.
+            for slot in range(detected_count + 1, state.active_occupants + 1):
+                state.occupant_absent_since.setdefault(slot, now)
+
+            expired_slots = [
+                slot
+                for slot in range(detected_count + 1, state.active_occupants + 1)
+                if now - state.occupant_absent_since[slot] >= grace_seconds
+            ]
+            if expired_slots:
+                for slot in expired_slots:
+                    state.occupant_absent_since.pop(slot, None)
+                state.active_occupants -= len(expired_slots)
             return
 
-        # Person is confirmed present in this exact frame! Reset empty timer.
-        state.warehouse_empty_since = None
-
-        if state.dispatching_alert:
-            state.warehouse_present = True
+        if detected_count == state.active_occupants:
+            state.occupant_absent_since.clear()
             return
 
-        realert_seconds = float(
-            getattr(self.settings, "warehouse_realert_seconds", WAREHOUSE_REALERT_SECONDS)
-            or WAREHOUSE_REALERT_SECONDS
-        )
+        # Positive entry delta: detected_count > active_occupants.
+        new_entries = detected_count - state.active_occupants
+        state.active_occupants = detected_count
+        state.occupant_absent_since.clear()
 
-        is_repeat = False
-        if state.warehouse_present and state.warehouse_alert_sent:
-            # Person continues to stay in the room: suppress emails until 3 minutes
-            # have elapsed since the last email; if they leave earlier, the timer resets.
-            elapsed = now - state.warehouse_last_alert_mono
-            if elapsed < realert_seconds:
-                return
-            is_repeat = True
-
-        # Dispatch email immediately for fresh entry OR 3-minute continuous-presence repeat
-        state.warehouse_present = True
-        state.warehouse_alert_sent = True
-        state.warehouse_last_alert_mono = now
-        state.dispatching_alert = True
-
-        # Exact frame where the person was detected right now
         captured_frame = frame.copy()
         confidence = float(result.get("confidence", 0.0))
 
-        # Dispatch snapshot upload + DB insert + email asynchronously so camera monitoring never blocks
-        threading.Thread(
-            target=self._record_and_email_warehouse_intrusion,
-            args=(channel, state, captured_frame, person_count, confidence, is_repeat),
-            name=f"warehouse-alert-ch-{channel}",
-            daemon=True,
-        ).start()
+        # Queue snapshot upload + DB persistence + delivery on the non-blocking pool
+        # so subsequent entries on this channel are never blocked or dropped.
+        self._submit_dispatch(
+            self._record_and_email_warehouse_intrusion,
+            channel,
+            state,
+            captured_frame,
+            new_entries,
+            detected_count,
+            confidence,
+            event_time,
+        )
 
     def _record_and_email_warehouse_intrusion(
         self,
         channel: int,
         state: _ChannelMonitorState,
         captured_frame,
-        person_count: int,
+        new_entries: int,
+        total_occupants: int,
         confidence: float,
-        is_repeat: bool = False,
+        detected_at: datetime,
     ) -> None:
+        warehouse = self.owner_settings.get()["warehouse"]
+        location = self._resolve_camera_location(channel)
+        snapshot = self._save_snapshot(captured_frame, f"warehouse_ch{channel:02d}")
+        entry = Entry(
+            channel=channel,
+            authorized=False,
+            after_hours=True,
+            person_count=new_entries,
+            confidence=confidence,
+            warehouse_id=warehouse["id"],
+            entry_location=location,
+            snapshot=snapshot,
+            notes="Detected outside working hours (unknown person)",
+            severity="critical",
+            created_at=detected_at,
+        )
+
         try:
-            warehouse = self.owner_settings.get()["warehouse"]
-            location = self._resolve_camera_location(channel)
-            snapshot = self._save_snapshot(captured_frame, f"warehouse_ch{channel:02d}")
-            notes = (
-                "Person still present outside working hours (3-minute follow-up)"
-                if is_repeat
-                else "Detected outside working hours (unknown person)"
-            )
-            entry = Entry(
-                channel=channel,
-                authorized=False,
-                after_hours=True,
-                person_count=person_count,
-                confidence=confidence,
-                warehouse_id=warehouse["id"],
-                entry_location=location,
-                snapshot=snapshot,
-                notes=notes,
-                severity="critical",
-            )
+            self.store.insert_entry(entry)
+        except DataStoreError as error:
+            state.last_error = str(error)
+            logger.error("Could not save entry on channel %s: %s", channel, error)
+            return
 
-            try:
-                self.store.insert_entry(entry)
-            except DataStoreError as error:
-                state.last_error = str(error)
-                logger.error("Could not save entry on channel %s: %s", channel, error)
-                return
+        self.store.log(
+            "warning",
+            "After-hours entry recorded",
+            {
+                "channel": channel,
+                "after_hours": True,
+                "entry_id": entry.id,
+                "new_entries": new_entries,
+                "active_occupants": total_occupants,
+                "location": location,
+            },
+        )
+        self._publish("entry.created", entry.to_api())
 
-            self.store.log(
-                "warning",
-                "Warehouse entry recorded (3-min follow-up)" if is_repeat else "Warehouse entry recorded",
-                {"channel": channel, "after_hours": True, "entry_id": entry.id, "is_repeat": is_repeat},
+        snapshot_url = self._snapshot_url(snapshot)
+        try:
+            self.alerts.create_warehouse_alert(
+                entry,
+                snapshot_url=snapshot_url,
+                detected_at=detected_at,
             )
-            self._publish("entry.created", entry.to_api())
-
-            snapshot_url = self._snapshot_url(snapshot)
-            try:
-                self.alerts.create_warehouse_alert(
-                    entry,
-                    snapshot_url=snapshot_url,
-                    is_repeat=is_repeat,
-                )
-            except Exception as error:  # noqa: BLE001
-                state.last_error = str(error)
-                logger.exception("Warehouse alert failed on channel %s: %s", channel, error)
-        finally:
-            state.dispatching_alert = False
+        except Exception as error:  # noqa: BLE001
+            state.last_error = str(error)
+            logger.exception("Room entry alert failed on channel %s: %s", channel, error)
 
     # --------------------------------------------------------------- helpers
     def inspect_frame(self, channel: int) -> dict[str, Any]:
@@ -1312,7 +1348,7 @@ class SurveillanceProcessor:
                     "person_count": st.person_count,
                     "last_analysis_at": to_iso(st.last_analysis_at),
                     "last_error": st.last_error,
-                    "warehouse_present": st.warehouse_present,
+                    "active_occupants": st.active_occupants,
                 }
                 for ch, st in self._channel_states.items()
             }

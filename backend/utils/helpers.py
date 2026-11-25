@@ -30,7 +30,7 @@ def app_tz():
         return ZoneInfo(name)
     except ZoneInfoNotFoundError:
         # Windows installs may not ship IANA data; Pakistan has a fixed +05:00 offset.
-        if name in {"Asia/Karachi", "Asia/Kolkata", "Asia/Calcutta"}:
+        if name in {"Asia/Karachi", "PKT", "Asia/Kolkata", "Asia/Calcutta"}:
             return timezone(timedelta(hours=5))
         return UTC
 
@@ -47,11 +47,6 @@ def local_tz():
     return app_tz()
 
 
-def local_now() -> datetime:
-    return datetime.now(tz=local_tz())
-
-
-
 def local_date(value: datetime | None = None) -> date:
     moment = value or utcnow()
     if moment.tzinfo is None:
@@ -65,6 +60,13 @@ def to_local(value: datetime | None) -> datetime | None:
     if value.tzinfo is None:
         value = value.replace(tzinfo=UTC)
     return value.astimezone(local_tz())
+
+
+def format_local_datetime(value: datetime | None) -> str:
+    """Format a UTC or aware datetime consistently in the operating local timezone."""
+
+    local_dt = to_local(value) or current_time()
+    return local_dt.strftime("%d %b %Y, %H:%M:%S")
 
 
 def to_iso(value: Any) -> str | None:
@@ -117,11 +119,12 @@ def is_between(now: time, start: time, end: time) -> bool:
 
 
 def is_after_hours(start: str, end: str, now: datetime | None = None) -> bool:
-    """Check whether the current local time is outside working hours."""
+    """Check whether the local time is outside working hours."""
 
-    moment = (now or current_time()).time()
+    local_moment = to_local(now) if now is not None else current_time()
+    moment = local_moment.time()
     start_time = parse_hhmm(start, time(21, 0))
-    end_time = parse_hhmm(end, time(11, 0))
+    end_time = parse_hhmm(end, time(6, 0))
     return is_between(moment, start_time, end_time)
 
 

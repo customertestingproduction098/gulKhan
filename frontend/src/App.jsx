@@ -22,13 +22,21 @@ export default function App() {
       if (type === 'alert.created') {
         dispatch(fetchAlerts({ limit: 50 }))
         const alert = data?.alert || data
-        const chStr = alert?.channel != null ? ` (Camera ${alert.channel})` : ''
         if (alert?.severity === 'critical') {
-          toast.warn((alert.title ? `${alert.title}${chStr}` : 'Critical security alert'), {
-            toastId: `alert-${alert.channel || 'all'}`,
+          const cameraLabel =
+            alert?.metadata?.camera_label ||
+            (alert?.channel != null ? `CH ${String(alert.channel).padStart(2, '0')}` : '')
+          const title = alert.title || 'Critical security alert'
+          const toastText =
+            cameraLabel && !title.includes(cameraLabel) ? `${title} (${cameraLabel})` : title
+          toast.warn(toastText, {
+            toastId: `alert-${alert.id || alert.channel || 'all'}`,
             autoClose: 5000,
           })
         }
+      }
+      if (type === 'alert.updated' || type === 'alert.acknowledged') {
+        dispatch(fetchAlerts({ limit: 50 }))
       }
       if (type === 'entry.created' || type === 'monitoring.started' || type === 'monitoring.stopped') {
         dispatch(fetchCameraStatus())

@@ -64,6 +64,25 @@ export default function Settings() {
     }))
   }
 
+  const updateWarehouse = (field, value) => {
+    setSettings((current) => ({
+      ...current,
+      warehouse: {
+        ...(current?.warehouse || {}),
+        [field]: value,
+      },
+    }))
+  }
+
+  const updateCamera = (channel, field, value) => {
+    setSettings((current) => ({
+      ...current,
+      cameras: (current?.cameras || []).map((camera) =>
+        camera.channel === channel ? { ...camera, [field]: value } : camera,
+      ),
+    }))
+  }
+
   const save = async () => {
     setSaving(true)
     try {
@@ -95,6 +114,8 @@ export default function Settings() {
   }
 
   const owner = settings.owner || {}
+  const warehouse = settings.warehouse || {}
+  const cameras = Array.isArray(settings.cameras) ? settings.cameras : []
 
   return (
     <div className="space-y-6">
@@ -216,6 +237,93 @@ export default function Settings() {
               />
             </Field>
           </div>
+        </Section>
+
+        {/* SECTION 3: After-Hours Security Window */}
+        <Section
+          title="After-Hours Security Window"
+          description="24-hour local time window when room entry alerts are active (windows may cross midnight)."
+        >
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field
+              label="After-hours start"
+              hint="Time when after-hours monitoring arms (e.g. 21:00)."
+            >
+              <input
+                type="time"
+                className="input font-mono"
+                value={warehouse.after_hours_start ?? '21:00'}
+                onChange={(e) => updateWarehouse('after_hours_start', e.target.value)}
+                required
+              />
+            </Field>
+
+            <Field
+              label="After-hours end"
+              hint="Time when daytime hours resume and alerts disarm (e.g. 06:00)."
+            >
+              <input
+                type="time"
+                className="input font-mono"
+                value={warehouse.after_hours_end ?? '06:00'}
+                onChange={(e) => updateWarehouse('after_hours_end', e.target.value)}
+                required
+              />
+            </Field>
+          </div>
+        </Section>
+
+        {/* SECTION 4: Camera Names & Locations */}
+        <Section
+          title="Camera Names & Locations"
+          description="Assign each channel a readable name and room/location label shown in alerts and emails."
+        >
+          {cameras.length === 0 ? (
+            <p className="note">No camera channels configured.</p>
+          ) : (
+            <div className="divide-y divide-rule-soft">
+              {cameras.map((camera) => (
+                <div
+                  key={camera.channel}
+                  className="grid gap-3 py-3 first:pt-0 last:pb-0 sm:grid-cols-[auto_1fr_1fr_auto] sm:items-end"
+                >
+                  <span className="tag self-center font-mono">
+                    CH {String(camera.channel).padStart(2, '0')}
+                  </span>
+
+                  <Field label="Camera name">
+                    <input
+                      type="text"
+                      className="input"
+                      value={camera.name ?? ''}
+                      onChange={(e) => updateCamera(camera.channel, 'name', e.target.value)}
+                      placeholder={`Camera ${String(camera.channel).padStart(2, '0')}`}
+                    />
+                  </Field>
+
+                  <Field label="Room / Location">
+                    <input
+                      type="text"
+                      className="input"
+                      value={camera.location ?? ''}
+                      onChange={(e) => updateCamera(camera.channel, 'location', e.target.value)}
+                      placeholder="e.g. Lounge 2"
+                    />
+                  </Field>
+
+                  <label className="flex cursor-pointer items-center gap-2 pb-2 font-mono text-[10px] uppercase tracking-[0.08em] text-ink-soft">
+                    <input
+                      type="checkbox"
+                      checked={Boolean(camera.enabled)}
+                      onChange={(e) => updateCamera(camera.channel, 'enabled', e.target.checked)}
+                      className="h-3.5 w-3.5"
+                    />
+                    Enabled
+                  </label>
+                </div>
+              ))}
+            </div>
+          )}
         </Section>
       </div>
 

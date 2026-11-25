@@ -15,6 +15,7 @@ from services.alert_system import AlertSystem
 from services.mongodb_handler import MongoHandler
 from services.settings_service import SettingsService
 from utils.helpers import (
+    format_local_datetime,
     iso_week_label,
     local_date,
     parse_date,
@@ -22,6 +23,7 @@ from utils.helpers import (
     parse_week,
     range_bounds,
     to_local,
+    utcnow,
 )
 
 logger = logging.getLogger(__name__)
@@ -215,7 +217,7 @@ class ReportService:
             6,
             self._pdf_text(
                 f"{start_date.isoformat()} to {end_date.isoformat()} - generated "
-                f"{datetime.now().strftime('%d %b %Y, %H:%M')}"
+                f"{format_local_datetime(utcnow())}"
             ),
             new_x="LMARGIN",
             new_y="NEXT",
@@ -329,7 +331,8 @@ class ReportService:
         recipients = self.owner_settings.report_recipients()
         subject = f"Daily shop report - {report.date}"
         if report.missed_greetings:
-            subject += f" - {report.missed_greetings} missed greeting(s)"
+            noun = "missed greeting" if report.missed_greetings == 1 else "missed greetings"
+            subject += f" - {report.missed_greetings} {noun}"
 
         rows = [
             ("Customers", str(report.total_customers)),

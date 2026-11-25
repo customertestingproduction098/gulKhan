@@ -20,8 +20,10 @@ def list_alerts():
     limit = request.args.get("limit", default=50, type=int) or 50
     days = request.args.get("days", type=int)
     acknowledged = _parse_bool(request.args.get("acknowledged"))
-    severity = (request.args.get("severity") or "").upper() or None
-    alert_type = (request.args.get("type") or request.args.get("alert_type") or "").upper() or None
+    if acknowledged is None and (request.args.get("status") or "").strip().lower() == "pending":
+        acknowledged = False
+    severity = (request.args.get("severity") or "").strip().lower() or None
+    alert_type = (request.args.get("type") or request.args.get("alert_type") or "").strip().lower() or None
     channel = request.args.get("channel", type=int)
 
     alerts, total = get_store().list_alerts(

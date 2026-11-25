@@ -1,4 +1,5 @@
-import { cx, formatTime, timeAgo } from '../utils/helpers'
+import { cx } from '../utils/helpers'
+import { formatTime, timeAgo } from '../utils/time'
 import { IconAlert, IconCheck } from './Icons'
 
 const severityTag = {
@@ -54,7 +55,23 @@ export default function AlertLog({
 
         {!loading &&
           visible.map((alert) => {
-            const acknowledged = alert.acknowledged || alert.status === 'acknowledged'
+            const acknowledged =
+              Boolean(alert.acknowledged) ||
+              String(alert.status || '').toLowerCase() === 'acknowledged'
+            const locationLabel = (
+              alert.metadata?.camera_label ||
+              (alert.metadata?.location && alert.channel != null
+                ? `${alert.metadata.location} (CH ${String(alert.channel).padStart(2, '0')})`
+                : alert.channel != null
+                  ? `CH ${String(alert.channel).padStart(2, '0')}`
+                  : 'All cameras')
+            )
+            const typeLabel =
+              alert.type === 'warehouse_entry'
+                ? 'Room entry'
+                : alert.type
+                  ? alert.type.replace(/_/g, ' ')
+                  : ''
             return (
               <article
                 key={alert.id}
@@ -75,8 +92,8 @@ export default function AlertLog({
                   </div>
                   <p className="mt-1 text-[13px] leading-relaxed text-ink-soft">{alert.message}</p>
                   <p className="mt-1.5 font-mono text-[10px] uppercase tracking-[0.08em] text-ink-faint">
-                    {alert.channel ? `CH ${String(alert.channel).padStart(2, '0')}` : 'All cameras'}
-                    {alert.type ? ` · ${alert.type.replace(/_/g, ' ')}` : ''}
+                    {locationLabel}
+                    {typeLabel ? ` · ${typeLabel}` : ''}
                   </p>
                 </div>
 
