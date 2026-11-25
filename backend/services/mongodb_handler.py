@@ -524,7 +524,7 @@ class MongoHandler:
 
     def list_alerts(
         self,
-        limit: int = 50,
+        limit: int | None = None,
         days: int | None = None,
         acknowledged: bool | None = None,
         severity: str | None = None,
@@ -551,17 +551,15 @@ class MongoHandler:
         try:
             collection = self.db[ALERTS]
             total = collection.count_documents(query)
-            cursor = (
-                collection.find(query)
-                .sort("created_at", DESCENDING)
-                .limit(max(1, min(limit, 500)))
-            )
+            cursor = collection.find(query).sort("created_at", DESCENDING)
+            if limit is not None and limit > 0:
+                cursor = cursor.limit(limit)
             items = [Alert.from_document(doc).to_api() for doc in cursor]
             return items, total
         except PyMongoError as error:
             raise DataStoreError(str(error)) from error
 
-    def pending_alerts(self, limit: int = 100) -> tuple[list[dict[str, Any]], int]:
+    def pending_alerts(self, limit: int | None = None) -> tuple[list[dict[str, Any]], int]:
         return self.list_alerts(limit=limit, acknowledged=False)
 
     def get_alert(self, alert_id: str) -> dict[str, Any] | None:

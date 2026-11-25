@@ -70,7 +70,7 @@ export default function Warehouse() {
   // Initial fetch for camera status and alerts on mount
   useEffect(() => {
     dispatch(fetchCameraStatus())
-    dispatch(fetchAlerts({ limit: 50 }))
+    dispatch(fetchAlerts())
   }, [dispatch])
 
   // Load entries on mount and whenever afterHoursOnly filter changes

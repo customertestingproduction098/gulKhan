@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useDispatch, useSelector } from 'react-redux'
 import { toast } from 'react-toastify'
 import { alertApi } from '../services/api'
@@ -83,13 +83,11 @@ export default function Alerts() {
   const [pendingOnly, setPendingOnly] = useState(false)
   const [selected, setSelected] = useState(null)
   const [detailLoading, setDetailLoading] = useState(false)
+  const [showBoxes, setShowBoxes] = useState(true)
 
   const load = useCallback(() => {
-    const params = { limit: 100 }
-    if (severity) params.severity = severity
-    if (pendingOnly) params.acknowledged = false
-    dispatch(fetchAlerts(params))
-  }, [dispatch, pendingOnly, severity])
+    dispatch(fetchAlerts())
+  }, [dispatch])
 
   useEffect(() => {
     load()
@@ -127,11 +125,36 @@ export default function Alerts() {
     }
   }
 
-  const pending = items.filter((alert) => !isAcknowledged(alert))
-  const critical = items.filter((alert) => alert.severity === 'critical').length
+  const visibleItems = useMemo(() => {
+    return items.filter((alert) => {
+      if (alert.title === 'System Alert' || alert.title === 'Test alert') return false
+      if (severity && (alert.severity || '').toLowerCase() !== severity) return false
+      if (pendingOnly && isAcknowledged(alert)) return false
+      return true
+    })
+  }, [items, pendingOnly, severity])
+
+  const realItems = useMemo(
+    () => items.filter((alert) => alert.title !== 'System Alert' && alert.title !== 'Test alert'),
+    [items],
+  )
+  const pending = realItems.filter((alert) => !isAcknowledged(alert))
+  const critical = realItems.filter((alert) => alert.severity === 'critical').length
   const selectedAcknowledged = selected ? isAcknowledged(selected) : false
   const selectedDelivery = selected ? describeDelivery(selected) : null
   const selectedLocation = selected ? getLocationLabel(selected) : ''
+  const selectedDetections = Array.isArray(selected?.metadata?.detections)
+    ? selected.metadata.detections.filter(
+        (box) =>
+          box &&
+          typeof box.x1 === 'number' &&
+          typeof box.y1 === 'number' &&
+          typeof box.x2 === 'number' &&
+          typeof box.y2 === 'number' &&
+          box.x2 > box.x1 &&
+          box.y2 > box.y1,
+      )
+    : []
   const selectedEscalations = Array.isArray(selected?.escalations)
     ? selected.escalations
         .map((step) => step?.stage || step?.channel || step?.level)
@@ -163,7 +186,7 @@ export default function Alerts() {
         </div>
         <div className="bg-sheet p-4 sm:p-5">
           <p className="eyebrow">On file</p>
-          <p className="figure mt-3">{items.length}</p>
+          <p className="figure mt-3">{realItems.length}</p>
         </div>
       </div>
 
@@ -191,7 +214,7 @@ export default function Alerts() {
         </label>
         {error && <span className="text-sm text-rust">{error}</span>}
         <span className="ml-auto font-mono text-[10px] uppercase tracking-[0.1em] text-ink-faint">
-          {items.length} loaded
+          {visibleItems.length} loaded
         </span>
       </div>
 
@@ -207,13 +230,13 @@ export default function Alerts() {
             {loading && (
               <p className="px-5 py-8 text-center text-sm text-ink-soft">Reading alerts…</p>
             )}
-            {!loading && items.length === 0 && (
+            {!loading && visibleItems.length === 0 && (
               <div className="px-5 py-10 text-center">
                 <p className="text-sm font-medium text-ink">No alerts match these filters.</p>
                 <p className="note mt-1">Clear the severity or pending filter to see the full log.</p>
               </div>
             )}
-            {items.filter(alert => alert.title !== 'System Alert' && alert.title !== 'Test alert').map((alert) => {
+            {visibleItems.map((alert) => {
               const acknowledged = isAcknowledged(alert)
               const isSelected = selected?.id === alert.id
               return (
@@ -339,12 +362,46 @@ export default function Alerts() {
 
               {selected.snapshot_url && (
                 <div className="mt-5">
-                  <p className="eyebrow mb-2">Snapshot</p>
-                  <img
-                    src={selected.snapshot_url}
-                    alt="Alert snapshot"
-                    className="w-full border border-rule object-cover"
-                  />
+                  <div className="mb-2 flex items-center justify-between gap-2">
+                    <p className="eyebrow">Snapshot</p>
+                    {selectedDetections.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setShowBoxes((prev) => !prev)}
+                        className="font-mono text-[10px] uppercase tracking-[0.1em] text-rust underline decoration-rust/40 underline-offset-2 hover:text-rust-deep"
+                      >
+                        {showBoxes
+                          ? `Hide boxes (${selectedDetections.length})`
+                          : `Show boxes (${selectedDetections.length})`}
+                      </button>
+                    )}
+                  </div>
+                  <div className="relative overflow-hidden border border-rule">
+                    <img
+                      src={selected.snapshot_url}
+                      alt="Alert snapshot"
+                      className="block w-full object-cover"
+                    />
+                    {showBoxes &&
+                      selectedDetections.map((box, idx) => {
+                        const left = `${Math.max(0, Math.min(100, box.x1 * 100))}%`
+                        const top = `${Math.max(0, Math.min(100, box.y1 * 100))}%`
+                        const width = `${Math.max(0, Math.min(100, (box.x2 - box.x1) * 100))}%`
+                        const height = `${Math.max(0, Math.min(100, (box.y2 - box.y1) * 100))}%`
+                        const pct = Math.round(Number(box.score || 0) * 100)
+                        return (
+                          <div
+                            key={`${box.x1}-${box.y1}-${idx}`}
+                            className="pointer-events-none absolute border-2 border-rust bg-rust/10"
+                            style={{ left, top, width, height }}
+                          >
+                            <span className="absolute -top-5 left-0 whitespace-nowrap bg-rust px-1.5 py-0.5 font-mono text-[10px] font-semibold leading-none text-white">
+                              Person {pct}%
+                            </span>
+                          </div>
+                        )
+                      })}
+                  </div>
                 </div>
               )}
 

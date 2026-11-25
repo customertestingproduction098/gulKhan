@@ -44,7 +44,7 @@ export default function Dashboard() {
 
   const load = useCallback(async () => {
     setLoading(true)
-    dispatch(fetchAlerts({ limit: 50 }))
+    dispatch(fetchAlerts())
     try {
       const [entryData, settingData] = await Promise.all([
         entryApi.list({ limit: 25 }),
@@ -65,7 +65,7 @@ export default function Dashboard() {
 
   useEffect(() => {
     load()
-    const timer = setInterval(() => dispatch(fetchAlerts({ limit: 50 })), 30000)
+    const timer = setInterval(() => dispatch(fetchAlerts()), 30000)
     return () => clearInterval(timer)
   }, [dispatch, load])
 

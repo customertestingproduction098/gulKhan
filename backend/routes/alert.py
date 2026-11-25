@@ -17,7 +17,9 @@ def _parse_bool(value):
 
 @bp.get("")
 def list_alerts():
-    limit = request.args.get("limit", default=50, type=int) or 50
+    limit = request.args.get("limit", type=int)
+    if limit is not None and limit <= 0:
+        limit = None
     days = request.args.get("days", type=int)
     acknowledged = _parse_bool(request.args.get("acknowledged"))
     if acknowledged is None and (request.args.get("status") or "").strip().lower() == "pending":
@@ -39,7 +41,9 @@ def list_alerts():
 
 @bp.get("/pending")
 def pending_alerts():
-    limit = request.args.get("limit", default=100, type=int) or 100
+    limit = request.args.get("limit", type=int)
+    if limit is not None and limit <= 0:
+        limit = None
     alerts, total = get_store().pending_alerts(limit=limit)
     return jsonify({"alerts": alerts, "total": total})
 

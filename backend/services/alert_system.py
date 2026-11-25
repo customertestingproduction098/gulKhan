@@ -10,6 +10,7 @@ from __future__ import annotations
 import html
 import logging
 import smtplib
+import socket
 import ssl
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
@@ -27,6 +28,41 @@ from utils.helpers import format_local_datetime, to_iso, utcnow
 logger = logging.getLogger(__name__)
 
 FCM_SCOPE = "https://www.googleapis.com/auth/firebase.messaging"
+RESEND_API_URL = "https://api.resend.com/emails"
+
+
+def _create_ipv4_socket(host: str, port: int, timeout: float) -> socket.socket:
+    """Resolve and connect strictly over IPv4 (AF_INET) to avoid IPv6 Errno 101 in cloud containers."""
+    infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+    if not infos:
+        raise OSError(f"No IPv4 address resolved for {host}:{port}")
+    last_error: OSError | None = None
+    for family, socktype, proto, _, sockaddr in infos:
+        sock = socket.socket(family, socktype, proto)
+        try:
+            sock.settimeout(timeout)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as error:
+            last_error = error
+            sock.close()
+    assert last_error is not None
+    raise last_error
+
+
+class _IPv4SMTP(smtplib.SMTP):
+    """smtplib.SMTP forcing IPv4 resolution while preserving hostname for TLS SNI."""
+
+    def _get_socket(self, host: str, port: int, timeout: float) -> socket.socket:
+        return _create_ipv4_socket(host, port, timeout)
+
+
+class _IPv4SMTP_SSL(smtplib.SMTP_SSL):
+    """smtplib.SMTP_SSL forcing IPv4 resolution while preserving hostname for TLS SNI."""
+
+    def _get_socket(self, host: str, port: int, timeout: float) -> socket.socket:
+        raw_sock = _create_ipv4_socket(host, port, timeout)
+        return self.context.wrap_socket(raw_sock, server_hostname=self._host)
 
 
 def _format_count(count: int, singular: str, plural: str) -> str:
@@ -73,6 +109,59 @@ class AlertSystem:
         return bool(self.owner_settings.notifications().get(channel, True))
 
     # ------------------------------------------------------------- delivery
+    def _send_email_resend(
+        self,
+        subject: str,
+        html_body: str,
+        recipient: str,
+        text_body: str | None = None,
+    ) -> dict[str, Any]:
+        api_key = (getattr(self.settings, "resend_api_key", "") or "").strip()
+        sender = (
+            getattr(self.settings, "resend_from", "") or self.settings.mail_from or ""
+        ).strip()
+        if not api_key or not sender:
+            return {
+                "sent": False,
+                "skipped": True,
+                "error": "Resend API key or sender not configured",
+                "to": recipient,
+            }
+        try:
+            response = requests.post(
+                RESEND_API_URL,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "from": sender,
+                    "to": [recipient],
+                    "subject": subject,
+                    "html": html_body,
+                    "text": text_body or html_body,
+                },
+                timeout=15,
+            )
+            response.raise_for_status()
+            payload = response.json() if response.content else {}
+            return {
+                "sent": True,
+                "skipped": False,
+                "to": recipient,
+                "provider": "resend",
+                "id": payload.get("id"),
+            }
+        except Exception as error:  # noqa: BLE001
+            logger.error("Resend HTTPS email delivery failed: %s", error)
+            return {
+                "sent": False,
+                "skipped": False,
+                "error": str(error),
+                "to": recipient,
+                "provider": "resend",
+            }
+
     def send_email(
         self,
         subject: str,
@@ -87,12 +176,22 @@ class AlertSystem:
                 "skipped": True,
                 "error": "Email notifications are disabled in settings",
             }
-        if not self.settings.smtp_host or not self.settings.mail_from or not recipient:
+        smtp_ready = bool(self.settings.smtp_host and self.settings.mail_from)
+        resend_key = (getattr(self.settings, "resend_api_key", "") or "").strip()
+        resend_sender = (
+            getattr(self.settings, "resend_from", "") or self.settings.mail_from or ""
+        ).strip()
+        resend_ready = bool(resend_key and resend_sender)
+
+        if not recipient or (not smtp_ready and not resend_ready):
             return {
                 "sent": False,
                 "skipped": True,
                 "error": "SMTP or owner email not configured",
             }
+
+        if not smtp_ready and resend_ready:
+            return self._send_email_resend(subject, html_body, recipient, text_body)
 
         try:
             message = MIMEMultipart("alternative")
@@ -104,7 +203,7 @@ class AlertSystem:
 
             context = ssl.create_default_context()
             if self.settings.smtp_secure:
-                with smtplib.SMTP_SSL(
+                with _IPv4SMTP_SSL(
                     self.settings.smtp_host,
                     self.settings.smtp_port,
                     context=context,
@@ -114,7 +213,7 @@ class AlertSystem:
                         server.login(self.settings.smtp_user, self.settings.smtp_pass)
                     server.sendmail(self.settings.mail_from, [recipient], message.as_string())
             else:
-                with smtplib.SMTP(
+                with _IPv4SMTP(
                     self.settings.smtp_host,
                     self.settings.smtp_port,
                     timeout=15,
@@ -126,9 +225,20 @@ class AlertSystem:
                         server.login(self.settings.smtp_user, self.settings.smtp_pass)
                     server.sendmail(self.settings.mail_from, [recipient], message.as_string())
 
-            return {"sent": True, "skipped": False, "to": recipient}
+            return {"sent": True, "skipped": False, "to": recipient, "provider": "smtp"}
         except Exception as error:  # noqa: BLE001
             logger.error("SMTP delivery failed: %s", error)
+            if resend_ready:
+                logger.info("Falling back to Resend HTTPS email API for %s", recipient)
+                fallback = self._send_email_resend(subject, html_body, recipient, text_body)
+                if fallback.get("sent"):
+                    return fallback
+                return {
+                    "sent": False,
+                    "skipped": False,
+                    "error": f"SMTP: {error}; Resend: {fallback.get('error')}",
+                    "to": recipient,
+                }
             return {"sent": False, "skipped": False, "error": str(error), "to": recipient}
 
     def send_push(
@@ -221,6 +331,8 @@ class AlertSystem:
         entry: Entry,
         snapshot_url: str | None = None,
         detected_at: datetime | None = None,
+        detections: list[dict[str, Any]] | None = None,
+        labels: list[str] | None = None,
     ) -> Alert:
         event_time = detected_at or entry.created_at or utcnow()
         after_hours = "after hours" if entry.after_hours else "during working hours"
@@ -261,6 +373,20 @@ class AlertSystem:
         if location_text:
             metadata["location"] = location_text
             metadata["entry_location"] = location_text
+        if detections is not None:
+            metadata["detections"] = [
+                {
+                    "x1": float(box.get("x1", 0.0)),
+                    "y1": float(box.get("y1", 0.0)),
+                    "x2": float(box.get("x2", 0.0)),
+                    "y2": float(box.get("y2", 0.0)),
+                    "score": float(box.get("score", 0.0)),
+                }
+                for box in detections
+                if isinstance(box, dict)
+            ]
+        if labels is not None:
+            metadata["labels"] = [str(lbl) for lbl in labels if lbl]
 
         # Persist the alert with the exact frame capture timestamp BEFORE any network I/O.
         alert = Alert(

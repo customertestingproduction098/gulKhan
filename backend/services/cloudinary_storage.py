@@ -77,7 +77,7 @@ class CloudinaryStorage:
             return None
 
         try:
-            jpeg_quality = quality or getattr(self.settings, "jpeg_quality", 85)
+            jpeg_quality = quality or getattr(self.settings, "snapshot_jpeg_quality", 92)
             success, buffer = cv2.imencode(
                 ".jpg",
                 frame,

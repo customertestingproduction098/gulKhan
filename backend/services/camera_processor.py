@@ -24,14 +24,12 @@ import threading
 import time
 from typing import Any
 
-# Configure FFmpeg RTSP options for live-edge streaming with zero reorder buffering
+# Configure FFmpeg RTSP options for crisp Full-HD Main Streams without dropping B/P-frame slices
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
     "rtsp_transport;tcp"
-    "|max_delay;200000"
-    "|reorder_queue_size;0"
-    "|fflags;nobuffer+discardcorrupt"
+    "|max_delay;500000"
+    "|fflags;nobuffer"
     "|flags;low_delay"
-    "|ec;favor_inter"
 )
 
 import cv2
@@ -41,7 +39,11 @@ from config.settings import Settings, get_settings
 from models import Entry, Interaction
 from models.interaction import TYPE_MISSED, TYPE_SUCCESSFUL, TYPE_UNATTENDED
 from services.alert_system import AlertSystem
-from services.aws_rekognition import DEFAULT_MIN_CONFIDENCE, get_vision_service
+from services.aws_rekognition import (
+    ENTRY_MIN_CONFIDENCE,
+    OCCUPANT_MIN_CONFIDENCE,
+    get_vision_service,
+)
 from services.cloudinary_storage import get_cloudinary_storage
 from services.events import EventBroker
 from services.mongodb_handler import DataStoreError, MongoHandler
@@ -64,10 +66,15 @@ SHOP_ABSENCE_GRACE_SECONDS = 2.5
 WAREHOUSE_ABSENCE_GRACE_SECONDS = 8.0
 FAST_POLL_SECONDS = 0.05
 MOTION_MIN_INTERVAL_SECONDS = 0.25
-WAREHOUSE_IDLE_PERIODIC_SECONDS = 5.0
-WAREHOUSE_PRESENT_PERIODIC_SECONDS = 2.0
+WAREHOUSE_OCCUPIED_MOTION_INTERVAL_SECONDS = 4.0
+WAREHOUSE_OCCUPIED_HEARTBEAT_SECONDS = 45.0
+CONFIRMATION_FRAMES = 2
 MOTION_PIXEL_THRESHOLD = 20
 MOTION_RATIO_THRESHOLD = 0.004
+BBOX_MOTION_PIXEL_THRESHOLD = 18
+BBOX_MOTION_RATIO_THRESHOLD = 0.08
+OCCUPANT_BOX_IOU_THRESHOLD = 0.30
+REKOGNITION_MAX_IMAGE_BYTES = int(4.5 * 1024 * 1024)
 
 
 @dataclass
@@ -98,9 +105,21 @@ class _ChannelMonitorState:
     # Warehouse occupant state (strictly per-camera)
     active_occupants: int = 0
     occupant_absent_since: dict[int, float] = field(default_factory=dict)
+    last_occupied_gray: Any = None
+    last_occupied_boxes: list[dict[str, Any]] = field(default_factory=list)
 
-    # Motion & timing state
+    # 2-frame entry confirmation candidate (preserves exact frame 1 & timestamp)
+    pending_entry_frame: Any = None
+    pending_entry_at: datetime | None = None
+    pending_entry_count: int = 0
+    pending_entry_frames: int = 0
+    pending_entry_confidence: float = 0.0
+    pending_entry_persons: list[dict[str, Any]] = field(default_factory=list)
+    pending_entry_labels: list[str] = field(default_factory=list)
+
+    # Motion & clean static background state
     prev_gray: Any = None
+    background_gray: Any = None
     last_had_motion: bool = False
     last_detection_mono: float = 0.0
     last_frame_revision: int = -1
@@ -268,25 +287,27 @@ class FrameGrabber:
     def wait_for_frame(self, timeout: float = 8.0) -> bool:
         return self._first_frame.wait(timeout=timeout) and self._frame is not None
 
-    def read_jpeg(self) -> bytes | None:
+    def read_jpeg(self, quality: int | None = None) -> bytes | None:
         now = time.monotonic()
         self._last_access = now
         self._last_stream_access = now
         with self._lock:
-            if self._jpeg is not None:
+            if quality is None and self._jpeg is not None:
                 return self._jpeg
             frame = None if self._frame is None else self._frame.copy()
         if frame is None:
             return None
+        encode_quality = int(quality) if quality is not None else int(self.settings.jpeg_quality)
         ok, buffer = cv2.imencode(
-            ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self.settings.jpeg_quality]
+            ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, encode_quality]
         )
         if not ok:
             return None
         jpeg = buffer.tobytes()
-        with self._lock:
-            if self._jpeg is None:
-                self._jpeg = jpeg
+        if quality is None:
+            with self._lock:
+                if self._jpeg is None:
+                    self._jpeg = jpeg
         return jpeg
 
     def read_frame(self):
@@ -609,6 +630,67 @@ class SurveillanceProcessor:
 
     # ------------------------------------------------------------------- loop
     @staticmethod
+    def _to_bg_gray(frame):
+        """Downscaled blurred BGR image for fast background/bbox motion checks."""
+        if frame is None:
+            return None
+        try:
+            small = cv2.resize(frame, (320, 180), interpolation=cv2.INTER_NEAREST)
+            return cv2.GaussianBlur(small, (5, 5), 0)
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _bbox_has_motion(bg_gray, curr_gray, box: dict[str, Any]) -> bool:
+        """Return True when the normalized bounding box has meaningful pixel change vs background."""
+        if bg_gray is None or curr_gray is None:
+            return True
+        try:
+            h, w = curr_gray.shape[:2]
+            x1 = max(0, min(w - 1, int(float(box.get("x1", 0.0)) * w)))
+            y1 = max(0, min(h - 1, int(float(box.get("y1", 0.0)) * h)))
+            x2 = max(x1 + 1, min(w, int(float(box.get("x2", 1.0)) * w)))
+            y2 = max(y1 + 1, min(h, int(float(box.get("y2", 1.0)) * h)))
+            roi_bg = bg_gray[y1:y2, x1:x2]
+            roi_curr = curr_gray[y1:y2, x1:x2]
+            if roi_bg.size == 0 or roi_curr.size == 0:
+                return False
+            diff = cv2.absdiff(roi_bg, roi_curr)
+            if diff.ndim == 3:
+                diff = np.max(diff, axis=2)
+            changed = int(np.count_nonzero(diff > BBOX_MOTION_PIXEL_THRESHOLD))
+            total_pixels = int(diff.size)
+            return (changed / float(total_pixels)) >= BBOX_MOTION_RATIO_THRESHOLD
+        except Exception:  # noqa: BLE001
+            return True
+
+    @staticmethod
+    def _box_iou(box_a: dict[str, Any], box_b: dict[str, Any]) -> float:
+        ax1, ay1 = float(box_a.get("x1", 0.0)), float(box_a.get("y1", 0.0))
+        ax2, ay2 = float(box_a.get("x2", 0.0)), float(box_a.get("y2", 0.0))
+        bx1, by1 = float(box_b.get("x1", 0.0)), float(box_b.get("y1", 0.0))
+        bx2, by2 = float(box_b.get("x2", 0.0)), float(box_b.get("y2", 0.0))
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        if inter <= 0.0:
+            return 0.0
+        area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        union = area_a + area_b - inter
+        return inter / union if union > 0.0 else 0.0
+
+    @staticmethod
+    def _clear_pending_entry(state: _ChannelMonitorState) -> None:
+        state.pending_entry_frame = None
+        state.pending_entry_at = None
+        state.pending_entry_count = 0
+        state.pending_entry_frames = 0
+        state.pending_entry_confidence = 0.0
+        state.pending_entry_persons = []
+        state.pending_entry_labels = []
+
+    @staticmethod
     def _compute_motion(prev_gray, frame) -> tuple[bool, Any]:
         """Fast <0.3ms motion check on a 160x90 thumbnail to catch entries immediately."""
         try:
@@ -616,13 +698,13 @@ class SurveillanceProcessor:
             gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
             gray = cv2.GaussianBlur(gray, (5, 5), 0)
             if prev_gray is None:
-                return True, gray
+                return False, gray
             diff = cv2.absdiff(prev_gray, gray)
             changed = int(np.count_nonzero(diff > MOTION_PIXEL_THRESHOLD))
             ratio = changed / float(160 * 90)
             return ratio >= MOTION_RATIO_THRESHOLD, gray
         except Exception:  # noqa: BLE001
-            return True, prev_gray
+            return False, prev_gray
 
     def _run_channel(self, channel: int, state: _ChannelMonitorState) -> None:
         grabber = self.manager.get(channel, autostart=True)
@@ -665,35 +747,69 @@ class SurveillanceProcessor:
                     if not is_after_hours(hours["start"], hours["end"], now=detected_at):
                         state.active_occupants = 0
                         state.occupant_absent_since.clear()
+                        state.last_occupied_gray = None
+                        state.last_occupied_boxes = []
+                        self._clear_pending_entry(state)
                         state.person_count = 0
                         state.last_had_motion = False
                         _, state.prev_gray = self._compute_motion(state.prev_gray, captured_frame)
+                        state.background_gray = self._to_bg_gray(captured_frame)
                         state.stop_event.wait(1.0)
                         continue
 
                 now = self._monotonic()
                 has_motion, next_gray = self._compute_motion(state.prev_gray, captured_frame)
-                elapsed_since_detect = now - state.last_detection_mono
+                motion_rising_edge = has_motion and not state.last_had_motion
 
                 if self.mode == MODE_WAREHOUSE:
-                    periodic_interval = (
-                        WAREHOUSE_PRESENT_PERIODIC_SECONDS
-                        if state.active_occupants > 0
-                        else WAREHOUSE_IDLE_PERIODIC_SECONDS
-                    )
-                    motion_interval = MOTION_MIN_INTERVAL_SECONDS
+                    has_pending_entry = state.pending_entry_frames > 0
+                    if has_pending_entry:
+                        # Immediately confirm on the very next live frame (~150-250ms later)
+                        should_detect = True
+                    elif state.active_occupants == 0:
+                        # Zero idle-room Rekognition calls: wake ONLY on real OpenCV motion
+                        elapsed_since_detect = (
+                            float("inf")
+                            if state.last_detection_mono == 0.0
+                            else now - state.last_detection_mono
+                        )
+                        should_detect = motion_rising_edge or (
+                            has_motion and elapsed_since_detect >= MOTION_MIN_INTERVAL_SECONDS
+                        )
+                    else:
+                        # Occupied room: throttle motion checks to 4.0s, slow 45.0s departure heartbeat
+                        if state.last_detection_mono == 0.0:
+                            state.last_detection_mono = now
+                        elapsed_since_detect = now - state.last_detection_mono
+                        should_detect = (
+                            has_motion
+                            and elapsed_since_detect >= WAREHOUSE_OCCUPIED_MOTION_INTERVAL_SECONDS
+                        ) or elapsed_since_detect >= WAREHOUSE_OCCUPIED_HEARTBEAT_SECONDS
                 else:
-                    periodic_interval = shop_periodic_interval
-                    motion_interval = MOTION_MIN_INTERVAL_SECONDS
+                    has_pending_entry = False
+                    elapsed_since_detect = now - state.last_detection_mono
+                    should_detect = (
+                        state.last_detection_mono == 0.0
+                        or motion_rising_edge
+                        or (has_motion and elapsed_since_detect >= MOTION_MIN_INTERVAL_SECONDS)
+                        or elapsed_since_detect >= shop_periodic_interval
+                    )
 
-                # Trigger immediately on rising-edge motion without waiting for periodic timers.
-                motion_rising_edge = has_motion and not state.last_had_motion
-                should_detect = (
-                    state.last_detection_mono == 0.0
-                    or motion_rising_edge
-                    or (has_motion and elapsed_since_detect >= motion_interval)
-                    or elapsed_since_detect >= periodic_interval
-                )
+                # Refresh static background smoothly while the room is empty and completely still.
+                if (
+                    self.mode == MODE_WAREHOUSE
+                    and state.active_occupants == 0
+                    and not has_motion
+                    and not has_pending_entry
+                ):
+                    curr_bg = self._to_bg_gray(captured_frame)
+                    if curr_bg is not None:
+                        if state.background_gray is None:
+                            state.background_gray = curr_bg
+                        else:
+                            state.background_gray = cv2.addWeighted(
+                                state.background_gray, 0.9, curr_bg, 0.1, 0
+                            )
 
                 # Only advance prev_gray when idle or actually analyzing so throttled motion
                 # frames never erase a real entry delta before analysis runs.
@@ -716,24 +832,45 @@ class SurveillanceProcessor:
 
         logger.info("Analysis loop stopped for channel %s", channel)
 
-    def _detect(self, frame) -> dict[str, Any]:
+    def _encode_for_rekognition(self, frame) -> bytes:
+        """Encode full-HD analysis frame at snapshot_jpeg_quality, staying under 4.5 MB."""
         analysis_frame = frame
-        if (
-            self.settings.analysis_width
-            and frame.shape[1] > self.settings.analysis_width
-        ):
-            scale = self.settings.analysis_width / frame.shape[1]
+        max_width = int(getattr(self.settings, "analysis_width", 1920) or 0)
+        if max_width > 0 and analysis_frame.shape[1] > max_width:
+            scale = max_width / analysis_frame.shape[1]
             analysis_frame = cv2.resize(
-                frame,
-                (self.settings.analysis_width, int(frame.shape[0] * scale)),
+                analysis_frame,
+                (max_width, max(1, int(analysis_frame.shape[0] * scale))),
                 interpolation=cv2.INTER_AREA,
             )
 
-        ok, buffer = cv2.imencode(
-            ".jpg", analysis_frame, [cv2.IMWRITE_JPEG_QUALITY, self.settings.jpeg_quality]
-        )
+        quality = int(getattr(self.settings, "snapshot_jpeg_quality", 92) or 92)
+        ok, buffer = cv2.imencode(".jpg", analysis_frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
         image_bytes = buffer.tobytes() if ok else b""
 
+        # If a massive raw sensor image still exceeds 4.5 MB, step down smoothly without upscaling.
+        while len(image_bytes) > REKOGNITION_MAX_IMAGE_BYTES:
+            if quality > 75:
+                quality = max(75, quality - 10)
+            else:
+                new_w = max(640, int(analysis_frame.shape[1] * 0.75))
+                if new_w >= analysis_frame.shape[1]:
+                    break
+                scale = new_w / analysis_frame.shape[1]
+                analysis_frame = cv2.resize(
+                    analysis_frame,
+                    (new_w, max(1, int(analysis_frame.shape[0] * scale))),
+                    interpolation=cv2.INTER_AREA,
+                )
+            ok, buffer = cv2.imencode(".jpg", analysis_frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+            if not ok:
+                return b""
+            image_bytes = buffer.tobytes()
+
+        return image_bytes
+
+    def _detect(self, frame) -> dict[str, Any]:
+        image_bytes = self._encode_for_rekognition(frame)
         if not image_bytes:
             logger.error("Failed to JPEG-encode frame for AWS Rekognition analysis")
             return {
@@ -767,17 +904,24 @@ class SurveillanceProcessor:
                 "source": "aws-rekognition-error",
                 "error": True,
             }
+        if result.get("error"):
+            return result
 
-        min_conf = getattr(self.settings, "rekognition_min_confidence", None)
-        if min_conf is None:
-            min_conf = DEFAULT_MIN_CONFIDENCE
-        min_ratio = float(min_conf) / 100.0
+        entry_conf = float(
+            getattr(self.settings, "rekognition_min_confidence", ENTRY_MIN_CONFIDENCE)
+            or ENTRY_MIN_CONFIDENCE
+        )
+        occupant_ratio = min(OCCUPANT_MIN_CONFIDENCE, entry_conf) / 100.0
+        entry_ratio = entry_conf / 100.0
         persons = result.get("persons") if isinstance(result.get("persons"), list) else []
         valid_persons = [
-            p for p in persons if float(p.get("score", result.get("confidence", 0.0))) >= min_ratio
+            p for p in persons if float(p.get("score", result.get("confidence", 0.0))) >= occupant_ratio
         ]
         result["persons"] = valid_persons
         result["person_count"] = len(valid_persons)
+        result["entry_person_count"] = sum(
+            1 for p in valid_persons if float(p.get("score", result.get("confidence", 0.0))) >= entry_ratio
+        )
         if valid_persons:
             result["confidence"] = round(
                 sum(float(p.get("score", 0.0)) for p in valid_persons) / len(valid_persons),
@@ -1156,21 +1300,37 @@ class SurveillanceProcessor:
         detected_at: datetime | None = None,
     ) -> None:
         event_time = detected_at or utcnow()
+        curr_bg = self._to_bg_gray(frame)
         hours = self.owner_settings.after_hours()
         if not is_after_hours(hours["start"], hours["end"], now=event_time):
             state.active_occupants = 0
             state.occupant_absent_since.clear()
+            state.last_occupied_gray = None
+            state.last_occupied_boxes = []
+            self._clear_pending_entry(state)
+            if curr_bg is not None:
+                state.background_gray = curr_bg
             return
 
-        # Ignore transient detector errors so we neither send false alerts nor
-        # prematurely clear active_occupants while someone is in the room.
+        # Ignore transient detector errors or daily budget cap without resetting active_occupants.
         if result.get("error"):
             return
 
-        persons = result.get("persons") if isinstance(result.get("persons"), list) else []
-        detected_count = max(0, int(result.get("person_count", 0)))
-        if not persons:
-            detected_count = 0
+        entry_conf = float(
+            getattr(self.settings, "rekognition_min_confidence", ENTRY_MIN_CONFIDENCE)
+            or ENTRY_MIN_CONFIDENCE
+        )
+        occupant_ratio = min(OCCUPANT_MIN_CONFIDENCE, entry_conf) / 100.0
+        entry_ratio = entry_conf / 100.0
+
+        raw_persons = result.get("persons") if isinstance(result.get("persons"), list) else []
+        occupant_persons = [
+            p
+            for p in raw_persons
+            if float(p.get("score", result.get("confidence", 0.0))) >= occupant_ratio
+        ]
+        labels = [str(lbl) for lbl in (result.get("labels") or []) if lbl]
+        detected_count = len(occupant_persons)
 
         now = self._monotonic()
         grace_seconds = self._absence_grace_seconds()
@@ -1180,6 +1340,7 @@ class SurveillanceProcessor:
             state.occupant_absent_since.pop(slot, None)
 
         if detected_count < state.active_occupants:
+            self._clear_pending_entry(state)
             # Start/track departure timers per missing occupant slot without dropping
             # active_occupants on brief occlusion or detector flicker.
             for slot in range(detected_count + 1, state.active_occupants + 1):
@@ -1194,19 +1355,125 @@ class SurveillanceProcessor:
                 for slot in expired_slots:
                     state.occupant_absent_since.pop(slot, None)
                 state.active_occupants -= len(expired_slots)
+            if state.active_occupants == 0:
+                state.last_occupied_gray = None
+                state.last_occupied_boxes = []
+                if curr_bg is not None:
+                    state.background_gray = curr_bg
             return
 
         if detected_count == state.active_occupants:
+            self._clear_pending_entry(state)
             state.occupant_absent_since.clear()
+            if state.active_occupants == 0 and curr_bg is not None:
+                if state.background_gray is None:
+                    state.background_gray = curr_bg
+                else:
+                    state.background_gray = cv2.addWeighted(
+                        state.background_gray, 0.9, curr_bg, 0.1, 0
+                    )
+            elif state.active_occupants > 0 and curr_bg is not None:
+                state.last_occupied_gray = curr_bg
+                state.last_occupied_boxes = [dict(p) for p in occupant_persons]
             return
 
-        # Positive entry delta: detected_count > active_occupants.
-        new_entries = detected_count - state.active_occupants
-        state.active_occupants = detected_count
-        state.occupant_absent_since.clear()
+        # Positive entry delta: verify candidate bounding boxes actually moved vs static background.
+        if state.background_gray is not None and curr_bg is not None:
+            moving_persons = [
+                p for p in occupant_persons if self._bbox_has_motion(state.background_gray, curr_bg, p)
+            ]
+        else:
+            if state.background_gray is None and curr_bg is not None:
+                state.background_gray = curr_bg
+            moving_persons = list(occupant_persons)
 
-        captured_frame = frame.copy()
-        confidence = float(result.get("confidence", 0.0))
+        # Dual-threshold hysteresis & seated-posture shift rejection:
+        if state.active_occupants == 0:
+            # At least one moving box must meet ENTRY_MIN_CONFIDENCE (85%); all moving
+            # occupant-tier boxes (>= 65%) are counted immediately so seated people aren't missed.
+            has_entry_box = any(
+                float(p.get("score", result.get("confidence", 0.0))) >= entry_ratio
+                for p in moving_persons
+            )
+            validated_persons = moving_persons if has_entry_box else []
+        else:
+            # Room is already occupied: keep boxes matching previously present occupants, and
+            # require any newly appeared box to show local pixel motion vs last_occupied_gray
+            # (rejects stationary seated people whose confidence ticks 84% -> 86%).
+            existing_boxes: list[dict[str, Any]] = []
+            new_boxes: list[dict[str, Any]] = []
+            for box in moving_persons:
+                is_existing = any(
+                    self._box_iou(box, prev_box) >= OCCUPANT_BOX_IOU_THRESHOLD
+                    for prev_box in state.last_occupied_boxes
+                )
+                if is_existing:
+                    existing_boxes.append(box)
+                else:
+                    if (
+                        state.last_occupied_gray is None
+                        or curr_bg is None
+                        or self._bbox_has_motion(state.last_occupied_gray, curr_bg, box)
+                    ):
+                        new_boxes.append(box)
+            has_high_conf_new = any(
+                float(p.get("score", result.get("confidence", 0.0))) >= entry_ratio
+                for p in new_boxes
+            )
+            validated_persons = (existing_boxes + new_boxes) if has_high_conf_new else []
+
+        effective_count = len(validated_persons)
+        if effective_count <= state.active_occupants:
+            self._clear_pending_entry(state)
+            return
+
+        # Require CONFIRMATION_FRAMES consecutive positive frames before alerting,
+        # while preserving frame 1 and its exact capture timestamp for zero delay.
+        if state.pending_entry_frames == 0:
+            state.pending_entry_frame = frame.copy()
+            state.pending_entry_at = event_time
+            state.pending_entry_count = effective_count
+            state.pending_entry_frames = 1
+            state.pending_entry_confidence = (
+                round(
+                    sum(float(p.get("score", 0.0)) for p in validated_persons)
+                    / len(validated_persons),
+                    4,
+                )
+                if validated_persons
+                else float(result.get("confidence", 0.0))
+            )
+            state.pending_entry_persons = [dict(p) for p in validated_persons]
+            state.pending_entry_labels = labels
+            if CONFIRMATION_FRAMES > 1:
+                return
+        else:
+            state.pending_entry_frames += 1
+            if state.pending_entry_frames < CONFIRMATION_FRAMES:
+                return
+
+        confirmed_count = min(state.pending_entry_count, effective_count)
+        if confirmed_count <= state.active_occupants:
+            self._clear_pending_entry(state)
+            return
+
+        captured_frame = (
+            state.pending_entry_frame.copy()
+            if state.pending_entry_frame is not None
+            else frame.copy()
+        )
+        captured_at = state.pending_entry_at or event_time
+        confidence = state.pending_entry_confidence or float(result.get("confidence", 0.0))
+        detections = list(state.pending_entry_persons)
+        confirmed_labels = list(state.pending_entry_labels)
+        self._clear_pending_entry(state)
+
+        new_entries = confirmed_count - state.active_occupants
+        state.active_occupants = confirmed_count
+        state.occupant_absent_since.clear()
+        if curr_bg is not None:
+            state.last_occupied_gray = curr_bg
+            state.last_occupied_boxes = [dict(p) for p in validated_persons]
 
         # Queue snapshot upload + DB persistence + delivery on the non-blocking pool
         # so subsequent entries on this channel are never blocked or dropped.
@@ -1216,9 +1483,11 @@ class SurveillanceProcessor:
             state,
             captured_frame,
             new_entries,
-            detected_count,
+            confirmed_count,
             confidence,
-            event_time,
+            captured_at,
+            detections,
+            confirmed_labels,
         )
 
     def _record_and_email_warehouse_intrusion(
@@ -1230,6 +1499,8 @@ class SurveillanceProcessor:
         total_occupants: int,
         confidence: float,
         detected_at: datetime,
+        detections: list[dict[str, Any]] | None = None,
+        labels: list[str] | None = None,
     ) -> None:
         warehouse = self.owner_settings.get()["warehouse"]
         location = self._resolve_camera_location(channel)
@@ -1275,6 +1546,8 @@ class SurveillanceProcessor:
                 entry,
                 snapshot_url=snapshot_url,
                 detected_at=detected_at,
+                detections=detections,
+                labels=labels,
             )
         except Exception as error:  # noqa: BLE001
             state.last_error = str(error)

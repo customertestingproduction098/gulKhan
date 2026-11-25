@@ -9,7 +9,7 @@ import useEventStream from './hooks/useEventStream'
 import Alerts from './pages/Alerts'
 import Settings from './pages/Settings'
 import Warehouse from './pages/Warehouse'
-import { fetchAlerts } from './store/slices/alertSlice'
+import { fetchAlerts, upsertAlert } from './store/slices/alertSlice'
 import { checkBackendHealth, fetchCameraStatus } from './store/slices/cameraSlice'
 
 export default function App() {
@@ -20,8 +20,11 @@ export default function App() {
   const handleEvent = useCallback(
     (type, data) => {
       if (type === 'alert.created') {
-        dispatch(fetchAlerts({ limit: 50 }))
         const alert = data?.alert || data
+        if (alert?.id) {
+          dispatch(upsertAlert(alert))
+        }
+        dispatch(fetchAlerts())
         if (alert?.severity === 'critical') {
           const cameraLabel =
             alert?.metadata?.camera_label ||
@@ -36,7 +39,11 @@ export default function App() {
         }
       }
       if (type === 'alert.updated' || type === 'alert.acknowledged') {
-        dispatch(fetchAlerts({ limit: 50 }))
+        const alert = data?.alert || data
+        if (alert?.id) {
+          dispatch(upsertAlert(alert))
+        }
+        dispatch(fetchAlerts())
       }
       if (type === 'entry.created' || type === 'monitoring.started' || type === 'monitoring.stopped') {
         dispatch(fetchCameraStatus())
@@ -53,12 +60,12 @@ export default function App() {
   useEffect(() => {
     if (!isAuthenticated) return undefined
     dispatch(checkBackendHealth())
-    dispatch(fetchAlerts({ limit: 50 }))
+    dispatch(fetchAlerts())
     dispatch(fetchCameraStatus())
 
     const healthTimer = setInterval(() => dispatch(checkBackendHealth()), 45000)
     const cameraTimer = setInterval(() => dispatch(fetchCameraStatus()), 30000)
-    const alertTimer = setInterval(() => dispatch(fetchAlerts({ limit: 50 })), 30000)
+    const alertTimer = setInterval(() => dispatch(fetchAlerts()), 30000)
 
     return () => {
       clearInterval(healthTimer)

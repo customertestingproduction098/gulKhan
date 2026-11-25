@@ -59,6 +59,12 @@ def camera_status():
 
     payload = processor.status()
     after_hours = owner.after_hours()
+    vision = getattr(processor, "vision", None)
+    rekog_calls_today = int(getattr(vision, "calls_today", 0) or 0)
+    rekog_daily_limit = int(
+        getattr(vision, "daily_limit", getattr(settings, "rekognition_max_calls_per_day", 150))
+        or 0
+    )
     payload.update(
         {
             "total_channels": len(settings.allowed_cameras),
@@ -71,6 +77,8 @@ def camera_status():
                 "active": is_after_hours(after_hours["start"], after_hours["end"]),
             },
             "features": owner.features(),
+            "rekognition_calls_today": rekog_calls_today,
+            "rekognition_daily_limit": rekog_daily_limit,
         }
     )
     return jsonify(payload)
@@ -180,7 +188,7 @@ def snapshot(channel: int):
     if not grabber.wait_for_frame(timeout=8.0):
         return jsonify({"error": "Camera stream unavailable", "channel": channel}), 503
 
-    jpeg = grabber.read_jpeg()
+    jpeg = grabber.read_jpeg(quality=settings.snapshot_jpeg_quality)
     if not jpeg:
         return jsonify({"error": "No frame available"}), 503
 

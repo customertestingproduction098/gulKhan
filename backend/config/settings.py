@@ -119,12 +119,15 @@ class Settings:
         default_factory=lambda: _str("CAMERA_RTSP_TEMPLATE", DEFAULT_RTSP_TEMPLATE)
     )
     camera_fps: int = field(default_factory=lambda: _int("CAMERA_FPS", 12))
-    frame_width: int = field(default_factory=lambda: _int("FRAME_WIDTH", 1280))
-    analysis_width: int = field(default_factory=lambda: _int("ANALYSIS_WIDTH", 640))
+    frame_width: int = field(default_factory=lambda: _int("FRAME_WIDTH", 1920))
+    analysis_width: int = field(default_factory=lambda: _int("ANALYSIS_WIDTH", 1920))
     frame_buffer_seconds: float = field(
         default_factory=lambda: _float("FRAME_BUFFER_SECONDS", 5.0)
     )
-    jpeg_quality: int = field(default_factory=lambda: _int("JPEG_QUALITY", 80))
+    jpeg_quality: int = field(default_factory=lambda: _int("JPEG_QUALITY", 85))
+    snapshot_jpeg_quality: int = field(
+        default_factory=lambda: _int("SNAPSHOT_JPEG_QUALITY", 92)
+    )
     camera_open_timeout_ms: int = field(
         default_factory=lambda: _int("CAMERA_OPEN_TIMEOUT_MS", 8000)
     )
@@ -202,6 +205,9 @@ class Settings:
         if _str("VISION_MIN_CONFIDENCE")
         else _float("REKOGNITION_MIN_CONFIDENCE", 85.0)
     )
+    rekognition_max_calls_per_day: int = field(
+        default_factory=lambda: _int("REKOGNITION_MAX_CALLS_PER_DAY", 150)
+    )
 
     # Google Cloud (kept for Firebase push only if needed)
     google_credentials: str = field(
@@ -232,6 +238,8 @@ class Settings:
     smtp_user: str = field(default_factory=lambda: _str("SMTP_USER"))
     smtp_pass: str = field(default_factory=lambda: _str("SMTP_PASS"))
     mail_from: str = field(default_factory=lambda: _str("MAIL_FROM"))
+    resend_api_key: str = field(default_factory=lambda: _str("RESEND_API_KEY"))
+    resend_from: str = field(default_factory=lambda: _str("RESEND_FROM"))
     owner_name: str = field(default_factory=lambda: _str("OWNER_NAME", "Store Owner"))
     owner_email: str = field(
         default_factory=lambda: _str("OWNER_EMAIL", "admin123@gmail.com")
@@ -357,7 +365,10 @@ class Settings:
 
     @property
     def email_configured(self) -> bool:
-        return bool(self.smtp_host and self.mail_from)
+        return bool(
+            (self.smtp_host and self.mail_from)
+            or (self.resend_api_key and (self.resend_from or self.mail_from))
+        )
 
     def is_camera_allowed(self, channel: int | None) -> bool:
         if channel is None:

@@ -3,6 +3,7 @@ import { alertApi } from '../../services/api'
 
 const initialState = {
   items: [],
+  total: 0,
   loading: false,
   error: null,
   lastFetchedAt: null,
@@ -35,11 +36,23 @@ const alertSlice = createSlice({
   name: 'alerts',
   initialState,
   reducers: {
+    upsertAlert(state, action) {
+      const incoming = action.payload
+      if (!incoming?.id) return
+      const index = state.items.findIndex((item) => item.id === incoming.id)
+      if (index >= 0) {
+        state.items[index] = { ...state.items[index], ...incoming }
+      } else {
+        state.items.unshift(incoming)
+        state.total = Math.max(state.total + 1, state.items.length)
+      }
+    },
     markAllRead(state) {
       state.items = state.items.map((alert) => ({ ...alert, acknowledged: true }))
     },
     clearAlerts(state) {
       state.items = []
+      state.total = 0
     },
   },
   extraReducers: (builder) => {
@@ -50,7 +63,9 @@ const alertSlice = createSlice({
       })
       .addCase(fetchAlerts.fulfilled, (state, action) => {
         state.loading = false
-        state.items = action.payload?.alerts ?? action.payload ?? []
+        const alerts = action.payload?.alerts ?? action.payload ?? []
+        state.items = alerts
+        state.total = action.payload?.total ?? alerts.length
         state.lastFetchedAt = new Date().toISOString()
       })
       .addCase(fetchAlerts.rejected, (state, action) => {
@@ -77,5 +92,5 @@ const alertSlice = createSlice({
   },
 })
 
-export const { markAllRead, clearAlerts } = alertSlice.actions
+export const { upsertAlert, markAllRead, clearAlerts } = alertSlice.actions
 export default alertSlice.reducer

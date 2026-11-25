@@ -102,7 +102,8 @@ export default function CameraViewer({
                 }
                 const ctx = canvas.getContext('2d')
                 if (ctx) {
-                  ctx.drawImage(bitmap, 0, 0)
+                  ctx.imageSmoothingEnabled = false
+                  ctx.drawImage(bitmap, 0, 0, bitmap.width, bitmap.height)
                 }
                 bitmap.close()
               })
@@ -177,7 +178,7 @@ export default function CameraViewer({
         </div>
       </div>
 
-      <div className="relative aspect-video w-full bg-sheet-pure">
+      <div className="relative aspect-video w-full bg-ink">
         {streamError ? (
           <div className="grid h-full w-full place-items-center p-6 text-center">
             <div className="space-y-2">
