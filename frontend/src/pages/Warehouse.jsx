@@ -161,7 +161,7 @@ export default function Warehouse() {
           <p className="mt-3 font-mono text-[22px] font-bold leading-none tabular-nums text-ochre">
             {status?.after_hours?.start ?? '21:00'}
             <span className="px-1 text-ink-faint">–</span>
-            {status?.after_hours?.end ?? '06:00'}
+            {status?.after_hours?.end ?? '11:00'}
           </p>
           <p className="note mt-3">
             {status?.after_hours?.active ? 'Inside the window now' : 'Outside the window now'}

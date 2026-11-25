@@ -260,12 +260,12 @@ export default function Settings() {
 
             <Field
               label="After-hours end"
-              hint="Time when daytime hours resume and alerts disarm (e.g. 06:00)."
+              hint="Time when daytime hours resume and alerts disarm (e.g. 11:00)."
             >
               <input
                 type="time"
                 className="input font-mono"
-                value={warehouse.after_hours_end ?? '06:00'}
+                value={warehouse.after_hours_end ?? '11:00'}
                 onChange={(e) => updateWarehouse('after_hours_end', e.target.value)}
                 required
               />

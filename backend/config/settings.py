@@ -154,7 +154,7 @@ class Settings:
         default_factory=lambda: _str("WAREHOUSE_AFTER_HOURS_START", "21:00")
     )
     after_hours_end: str = field(
-        default_factory=lambda: _str("WAREHOUSE_AFTER_HOURS_END", "06:00")
+        default_factory=lambda: _str("WAREHOUSE_AFTER_HOURS_END", "11:00")
     )
     shop_id: str = field(default_factory=lambda: _str("SHOP_ID", "shop_001"))
     shop_name: str = field(default_factory=lambda: _str("SHOP_NAME", "Main Shop"))

@@ -71,7 +71,7 @@ export default function Dashboard() {
 
   const warehouse = settings?.warehouse || {}
   const startTime = warehouse.after_hours_start || '21:00'
-  const endTime = warehouse.after_hours_end || '06:00'
+  const endTime = warehouse.after_hours_end || '11:00'
   const notificationEmail =
     settings?.owner?.notification_email ||
     owner?.notification_email ||

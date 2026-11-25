@@ -124,7 +124,7 @@ def is_after_hours(start: str, end: str, now: datetime | None = None) -> bool:
     local_moment = to_local(now) if now is not None else current_time()
     moment = local_moment.time()
     start_time = parse_hhmm(start, time(21, 0))
-    end_time = parse_hhmm(end, time(6, 0))
+    end_time = parse_hhmm(end, time(11, 0))
     return is_between(moment, start_time, end_time)
 
 
