@@ -24,12 +24,11 @@ import threading
 import time
 from typing import Any
 
-# Configure FFmpeg RTSP options for crisp Full-HD Main Streams without dropping B/P-frame slices
+# Configure FFmpeg RTSP options for crisp Full-HD HEVC/H.264 Main Streams without
+# dropping B/P-frame reference pictures (avoid nobuffer/low_delay which break HEVC RPS/POC).
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
     "rtsp_transport;tcp"
     "|max_delay;500000"
-    "|fflags;nobuffer"
-    "|flags;low_delay"
 )
 
 import cv2
